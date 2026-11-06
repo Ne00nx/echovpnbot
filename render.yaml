@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: echovpn-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python support_bot.py
