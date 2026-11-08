@@ -4,6 +4,7 @@ import os
 import html
 import json
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,6 +24,11 @@ OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+
+# --- НАСТРОЙКИ CYBERBIZ ---
+CYBERBIZ_SHOP_ID = "1794171345"
+CYBERBIZ_SECRET = "SNB1QkaHLuVPZEpjd"
+CYBERBIZ_API_TOKEN = "hrdQmAgJBgGniZoQ" 
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
@@ -103,167 +109,179 @@ async def reply_to_user(message: Message):
         await message.answer(f"❌ Ошибка при отправке: {e}")
 
 # ==========================================
-# ВЕБ-СЕРВЕР И API ДЛЯ СОЗДАНИЯ VPN
+# ФУНКЦИЯ АКТИВАЦИИ ПОДПИСКИ И СОЗДАНИЯ КЛЮЧЕЙ (Вынесена отдельно)
 # ==========================================
-async def handle(request):
-    return web.Response(text="EchoVPN bot is running!")
-
-async def handle_create_vpn(request):
-    logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!")
+async def process_successful_payment(user_id, days):
+    logging.info(f"🚀 Активация подписки для {user_id} на {days} дней")
     
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        logging.error(f"❌ ОШИБКА: Заголовок Authorization отсутствует. Получено: {auth_header}")
-        return web.Response(text=json.dumps({"error": "Missing or invalid Authorization header"}), status=401, content_type='application/json')
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
     
-    token = auth_header.split(' ')[1]
+    async with ClientSession() as session:
+        # Получаем email и текущую дату
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
+            profile_data = await resp.json()
+            user_email = profile_data[0].get('email', 'user') if profile_data else "user"
+            current_expires_str = profile_data[0].get('subscription_expires_at') if profile_data else None
+        
+        safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
+        client_name = safe_email
 
+        now = datetime.now(timezone.utc)
+        if current_expires_str:
+            current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
+            base_date = current_expires if current_expires > now else now
+        else:
+            base_date = now
+        
+        new_expires = base_date + timedelta(days=days)
+        new_expires_iso = new_expires.isoformat()
+        total_days_for_panel = max(1, (new_expires - now).days)
+
+        async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
+            servers = await resp.json()
+
+        generated_urls = {}
+        client_uuid = str(uuid.uuid4())
+
+        async def create_on_server(server):
+            api_url = server['api_url']
+            api_token = server['api_token']
+            inbound_id = server['inbound_id']
+            base_url = api_url.replace('/create', '')
+            
+            headers_xui = {"Content-Type": "application/json", "Authorization": f"Bearer {api_token}", "X-API-Key": api_token}
+
+            try:
+                encoded_name = quote(client_name, safe='')
+                async with session.delete(f"{base_url}/clients/{encoded_name}", headers=headers_xui, timeout=5): pass 
+            except Exception: pass
+
+            payload = {"name": client_name, "uuid": client_uuid, "days": total_days_for_panel, "inbound_ids": [inbound_id]}
+
+            try:
+                async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
+                    if resp.status in [200, 201]:
+                        domain = server['domain']
+                        pbk = server['pbk']
+                        sid = server['sid']
+                        
+                        if server.get('country_code') == 'ES':
+                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none#EchoVPN-{server['name']}"
+                        else:
+                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
+                        
+                        vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
+                        return server['id'], vless_url
+            except Exception as e:
+                logging.error(f"Сетевая ошибка на {server['name']}: {e}")
+            return None
+
+        tasks = [create_on_server(s) for s in servers]
+        results = await asyncio.gather(*tasks)
+
+        for result in results:
+            if result:
+                server_id, url = result
+                generated_urls[server_id] = url
+
+        if generated_urls:
+            update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
+            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
+                if resp.status not in [200, 204]:
+                    logging.error(f"Ошибка Supabase: {await resp.text()}")
+
+# ==========================================
+# API ДЛЯ ПРИЛОЖЕНИЯ (Создание платежа)
+# ==========================================
+async def handle_create_cyberbiz_payment(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
         days = data.get('days', 30)
+        amount = data.get('amount', 249.00)
 
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
+        # ХИТРОСТЬ: Передаем user_id и days прямо в order_id через подчеркивание
+        # Формат: user_id_days_timestamp
+        order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
         
-        async with ClientSession() as session:
-            # Проверка токена
-            sb_url = SUPABASE_URL.rstrip('/')
-            auth_url = f"{sb_url}/auth/v1/user"
-            
-            async with session.get(auth_url, headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"}) as auth_resp:
-                if auth_resp.status != 200:
-                    err_body = await auth_resp.text()
-                    logging.error(f"❌ ОШИБКА SUPABASE AUTH: Статус {auth_resp.status}. Ответ: {err_body}")
-                    return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+        # Формируем подпись (MD5 от суммы : order_id : секрета)
+        sign_str = f"{amount}:{order_id}:{CYBERBIZ_SECRET}"
+        signature = hashlib.md5(sign_str.encode()).hexdigest()
+
+        # Формируем ссылку на оплату
+        payment_url = (
+            f"https://api.cyberbiz.bz/pay?merchant_id={CYBERBIZ_SHOP_ID}"
+            f"&amount={amount}&order_id={order_id}&sign={signature}"
+            f"&desc=VPN+Subscription+{days}+days"
+        )
+        
+        logging.info(f"Создана ссылка на оплату: {payment_url}")
+
+        return web.Response(
+            text=json.dumps({"payment_url": payment_url}),
+            status=200,
+            content_type='application/json'
+        )
+    except Exception as e:
+        logging.error(f"Ошибка создания платежа: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+# ==========================================
+# ВЕБХУК ОТ CYBERBIZ (Прием уведомлений)
+# ==========================================
+async def handle_cyberbiz_webhook(request):
+    try:
+        data = await request.post()
+        logging.info(f"Получен вебхук от Cyberbiz: {data}")
+        
+        order_id = data.get('order_id')
+        status = data.get('status')
+        
+        if status == 'success' and order_id:
+            # Расшифровываем order_id обратно (user_id_days_timestamp)
+            parts = order_id.split('_')
+            if len(parts) >= 2:
+                user_id = parts[0]
+                days = int(parts[1])
                 
-                auth_data = await auth_resp.json()
-                real_user_id = auth_data.get('id')
-
-                if real_user_id != user_id:
-                    logging.error(f"❌ ОШИБКА: Несовпадение ID! В токене: {real_user_id}, В запросе: {user_id}")
-                    return web.Response(text=json.dumps({"error": "User ID mismatch"}), status=403, content_type='application/json')
-
-            # Получаем email и текущую дату подписки
-            async with session.get(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
-                profile_data = await resp.json()
-                user_email = profile_data[0].get('email', 'user') if profile_data else "user"
-                current_expires_str = profile_data[0].get('subscription_expires_at') if profile_data else None
-            
-            safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
-            client_name = safe_email
-
-            # Считаем новую дату
-            now = datetime.now(timezone.utc)
-            if current_expires_str:
-                current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
-                base_date = current_expires if current_expires > now else now
-            else:
-                base_date = now
-            
-            new_expires = base_date + timedelta(days=days)
-            new_expires_iso = new_expires.isoformat()
-
-            total_days_for_panel = max(1, (new_expires - now).days)
-
-            # Получаем сервера
-            async with session.get(f"{sb_url}/rest/v1/servers?select=*", headers=headers_sb) as resp:
-                servers = await resp.json()
-
-            generated_urls = {}
-            client_uuid = str(uuid.uuid4())
-
-            # Создаем клиентов
-            async def create_on_server(server):
-                api_url = server['api_url']
-                api_token = server['api_token']
-                inbound_id = server['inbound_id']
-                base_url = api_url.replace('/create', '')
+                # Запускаем процесс активации в фоне, чтобы не задерживать ответ
+                asyncio.create_task(process_successful_payment(user_id, days))
                 
-                headers_xui = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_token}",
-                    "X-API-Key": api_token
-                }
-
-                try:
-                    encoded_name = quote(client_name, safe='')
-                    async with session.delete(f"{base_url}/clients/{encoded_name}", headers=headers_xui, timeout=5) as del_resp:
-                        pass 
-                except Exception:
-                    pass
-
-                payload = {
-                    "name": client_name,
-                    "uuid": client_uuid,
-                    "days": total_days_for_panel,
-                    "inbound_ids": [inbound_id]
-                }
-
-                try:
-                    async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
-                        if resp.status in [200, 201]:
-                            domain = server['domain']
-                            pbk = server['pbk']
-                            sid = server['sid']
-                            
-                            # ХИТРОСТЬ: Для Испании (ES) генерируем ссылку БЕЗ flow
-                            if server.get('country_code') == 'ES':
-                                vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none#EchoVPN-{server['name']}"
-                            else:
-                                vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
-                            
-                            vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
-                            return server['id'], vless_url
-                        else:
-                            err = await resp.text()
-                            logging.error(f"Ошибка на сервере {server['name']}: {err}")
-                            return None
-                except Exception as e:
-                    logging.error(f"Сетевая ошибка на сервере {server['name']}: {e}")
-                    return None
-
-            tasks = [create_on_server(s) for s in servers]
-            results = await asyncio.gather(*tasks)
-
-            for result in results:
-                if result:
-                    server_id, url = result
-                    generated_urls[server_id] = url
-
-            if not generated_urls:
-                return web.Response(text=json.dumps({"error": "Все сервера недоступны"}), status=500, content_type='application/json')
-
-            # Обновляем базу
-            update_data = {
-                "vless_urls": generated_urls,
-                "subscription_plan": "premium",
-                "subscription_expires_at": new_expires_iso
-            }
-            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
-            
-            async with session.patch(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
-                if resp.status not in [200, 204]:
-                    err = await resp.text()
-                    logging.error(f"Ошибка Supabase при обновлении: {err}")
-                    return web.Response(text=json.dumps({"error": f"Supabase error: {err}"}), status=500, content_type='application/json')
-
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+                logging.info(f"✅ Оплата по заказу {order_id} успешна! Запущена активация.")
+                return web.Response(text="OK", status=200)
+        
+        logging.warning(f"❌ Оплата по заказу {order_id} не удалась. Статус: {status}")
+        return web.Response(text="OK", status=200)
 
     except Exception as e:
-        logging.error(f"Критическая ошибка API: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        logging.error(f"Ошибка обработки вебхука: {e}")
+        return web.Response(text="Error", status=500)
+
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', handle)
-    app.router.add_post('/api/create-vpn', handle_create_vpn)
+    # Добавляем поддержку CORS для работы с Flutter (хотя мы используем Worker, но на всякий случай)
+    import aiohttp_cors
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")
+    })
+
+    app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     
+    # Новые роуты
+    app.router.add_post('/api/cyberbiz/create-payment', handle_create_cyberbiz_payment)
+    app.router.add_post('/api/cyberbiz/webhook', handle_cyberbiz_webhook)
+    
+    for route in list(app.router.routes()):
+        cors.add(route)
+
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
