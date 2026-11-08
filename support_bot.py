@@ -4,6 +4,7 @@ import os
 import html
 import json
 import uuid
+from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
@@ -107,7 +108,7 @@ async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
 
 async def handle_create_vpn(request):
-    """Эндпоинт для безопасного создания ключей на серверах (Параллельно)"""
+    """Эндпоинт для безопасного создания ключей на серверах (с заменой старых)"""
     try:
         data = await request.json()
         user_id = data.get('userId')
@@ -122,35 +123,30 @@ async def handle_create_vpn(request):
         }
         
         async with ClientSession() as session:
-            # 1. Получаем профиль пользователя (чтобы взять email для понятного имени)
+            # 1. Получаем email пользователя
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email", headers=headers_sb) as resp:
                 profile_data = await resp.json()
                 user_email = profile_data[0]['email'] if profile_data else "user"
             
-            # Делаем безопасное имя для панели (убираем @ и точки)
+            # Делаем безопасное и ПОСТОЯННОЕ имя для панели (без UUID, чтобы не плодить сущности)
             safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
+            client_name = safe_email
             
             # 2. Получаем список серверов из Supabase
             async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
                 servers = await resp.json()
 
             generated_urls = {}
-            # Генерируем UUID один раз для всех серверов
+            # Генерируем новый UUID (он изменится, но имя останется прежним)
             client_uuid = str(uuid.uuid4())
-            # Имя клиента в панели: например, walpas666_803b
-            client_name = f"{safe_email}_{client_uuid[:4]}"
 
             async def create_on_server(server):
                 api_url = server['api_url']
                 api_token = server['api_token']
                 inbound_id = server['inbound_id']
                 
-                payload = {
-                    "name": client_name,
-                    "uuid": client_uuid,
-                    "days": days,
-                    "inbound_ids": [inbound_id]
-                }
+                # Вычисляем базовый URL для удаления (отрезаем /create)
+                base_url = api_url.replace('/create', '')
                 
                 headers_xui = {
                     "Content-Type": "application/json",
@@ -158,8 +154,24 @@ async def handle_create_vpn(request):
                     "X-API-Key": api_token
                 }
 
+                # Пытаемся удалить старого клиента с таким же именем
                 try:
-                    # Таймаут 5 секунд на каждый сервер
+                    encoded_name = quote(client_name, safe='')
+                    async with session.delete(f"{base_url}/clients/{encoded_name}", headers=headers_xui, timeout=5) as del_resp:
+                        if del_resp.status not in [200, 204, 404]:
+                            logging.warning(f"Не удалось удалить старого клиента {client_name} на {server['name']}: {del_resp.status}")
+                except Exception as e:
+                    logging.warning(f"Ошибка при удалении на {server['name']}: {e}")
+
+                # Создаем нового клиента
+                payload = {
+                    "name": client_name,
+                    "uuid": client_uuid,
+                    "days": days,
+                    "inbound_ids": [inbound_id]
+                }
+
+                try:
                     async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
                         if resp.status in [200, 201]:
                             domain = server['domain']
@@ -219,7 +231,6 @@ async def start_web_server():
 
 async def main():
     # Пауза 10 секунд, чтобы Render успел убить старый контейнер
-    # и Telegram не выдавал ошибку Conflict (два бота одновременно)
     logging.info("Ожидание завершения старого деплоя (10 сек)...")
     await asyncio.sleep(10)
     
