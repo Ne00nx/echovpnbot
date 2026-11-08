@@ -26,8 +26,10 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 # --- НАСТРОЙКИ AMYPAY ---
-AMYPAY_API_KEY = "942762fee9ff2d8a6d19692cf9478788"  # Твой ключ кассы из панели
-AMYPAY_SECRET_WORD_2 = "7df12fdb744e98892e05e624" # Нужно для проверки вебхуков
+# Твой новый ключ кассы из панели (тот, что на скриншоте)
+AMYPAY_API_KEY = "197b0dc212cd479917d6f786b055353" 
+# Обязательно вставь секретное слово №2 из панели Amypay!
+AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8" 
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
