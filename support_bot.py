@@ -26,9 +26,9 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 # --- НАСТРОЙКИ AMYPAY ---
-# Твой новый ключ кассы из панели (тот, что на скриншоте)
-AMYPAY_API_KEY = "197b0dc212cd479917d6f786b055353" 
-# Обязательно вставь секретное слово №2 из панели Amypay!
+# Твой новый токен из панели
+AMYPAY_API_KEY = "amy_account_b3ece4dea6d10fe507faeb26.afa6889ad6c20f0e84a1f20ce8652407466ca4a44e4e12a1b7dd815ce5b51f4d" 
+# ОБЯЗАТЕЛЬНО ВСТАВЬ СЕКРЕТНОЕ СЛОВО №2 ИЗ ПАНЕЛИ AMYPAY!
 AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8" 
 # ==========================================
 
