@@ -108,11 +108,10 @@ async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
 
 async def handle_create_vpn(request):
-    async def handle_create_vpn(request):
-    logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!") # <-- ДОБАВИТЬ ЭТУ СТРОКУ
-    try:
-        data = await request.json()
     """Эндпоинт для безопасного создания ключей на серверах (с заменой старых)"""
+    
+    logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!")
+    
     try:
         data = await request.json()
         user_id = data.get('userId')
@@ -234,10 +233,8 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    # Пауза 10 секунд, чтобы Render успел убить старый контейнер
     logging.info("Ожидание завершения старого деплоя (10 сек)...")
     await asyncio.sleep(10)
-    
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
