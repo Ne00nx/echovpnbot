@@ -26,8 +26,8 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 # --- НАСТРОЙКИ AMYPAY ---
-# Используем "Ключ кассы" из блока "Ключи доступа"
-AMYPAY_API_KEY = "197b0dc212cd479917d6f786b055353" 
+# Твой новый рабочий ключ!
+AMYPAY_API_KEY = "f0b08c0d83808ceb5a2d38f661b81a43" 
 # ОБЯЗАТЕЛЬНО ВСТАВЬ СЕКРЕТНОЕ СЛОВО №2 ИЗ ПАНЕЛИ AMYPAY!
 AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8"
 # ==========================================
@@ -37,6 +37,21 @@ router = Router()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
+
+# Функция для проверки ключа при старте сервера
+async def check_amypay_token():
+    url = "https://amypay.ru/api/v2/ping"
+    headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}"}
+    try:
+        async with ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=5) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    logging.info(f"✅ Amypay API ключ валиден! Ответ: {text}")
+                else:
+                    logging.error(f"❌ Amypay API ключ НЕВАЛИДЕН! Статус: {resp.status}, Ответ: {text}")
+    except Exception as e:
+        logging.error(f"Ошибка проверки ключа Amypay: {e}")
 
 def get_main_menu():
     keyboard = [
@@ -209,7 +224,6 @@ async def handle_create_amypay_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        # Формируем уникальный ID заказа (user_id_days_timestamp)
         order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
         
         api_url = "https://amypay.ru/api/v2/orders"
@@ -218,10 +232,9 @@ async def handle_create_amypay_payment(request):
             "Content-Type": "application/json"
         }
         
-        # ИСПРАВЛЕНО ПОД ДОКУМЕНТАЦИЮ: используем orderId и int для суммы
         payload = {
             "amount": int(amount), 
-            "orderId": order_id,
+            "external_order_id": order_id, # Используем правильное поле, как в cURL
             "description": f"EchoVPN Subscription ({days} days)"
         }
         
@@ -236,14 +249,19 @@ async def handle_create_amypay_payment(request):
                 resp_data = await resp.json()
                 
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    # Ссылка может лежать в order.pay_url или просто pay_url
-                    pay_url = resp_data.get('order', {}).get('pay_url') or resp_data.get('pay_url')
+                    # Ищем ссылку на оплату в ответе (обычно order.pay_url)
+                    order_data = resp_data.get('order', {})
+                    pay_url = order_data.get('pay_url') or order_data.get('payment_url')
+                    
                     if pay_url:
                         return web.Response(
                             text=json.dumps({"payment_url": pay_url}),
                             status=200,
                             content_type='application/json'
                         )
+                    else:
+                        logging.error(f"В ответе нет ссылки на оплату: {resp_data}")
+                        return web.Response(text=json.dumps({"error": "No pay_url in response"}), status=500, content_type='application/json')
                 
                 error_msg = resp_data.get('error', 'Unknown error')
                 logging.error(f"Ошибка Amypay API: {error_msg}")
@@ -254,7 +272,7 @@ async def handle_create_amypay_payment(request):
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 # ==========================================
-# ВЕБХУК ОТ AMYPAY (Прием уведомлений)
+# ВЕБХУК ОТ AMYPAY
 # ==========================================
 async def handle_amypay_webhook(request):
     try:
@@ -264,12 +282,11 @@ async def handle_amypay_webhook(request):
         order_number = data.get('order_number')
         amount = data.get('amount')
         status = data.get('status')
-        # Ищем ID заказа в разных возможных полях
-        external_order_id = data.get('orderId') or data.get('external_order_id') or data.get('desc')
+        external_order_id = data.get('external_order_id')
         signature = data.get('signature')
         
-        # Проверка подписи
         if order_number and amount and signature:
+            # Формируем строку для проверки подписи
             sign_str = f"{AMYPAY_API_KEY}:{order_number}:{amount}:{AMYPAY_SECRET_WORD_2}"
             expected_sign = hashlib.sha256(sign_str.encode()).hexdigest()
             
@@ -313,6 +330,8 @@ async def start_web_server():
 async def main():
     logging.info("Ожидание завершения старого деплоя (10 сек)...")
     await asyncio.sleep(10)
+    # Проверяем ключ перед запуском сервера
+    await check_amypay_token()
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
