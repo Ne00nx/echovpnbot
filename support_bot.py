@@ -109,11 +109,8 @@ async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
 
 async def handle_create_vpn(request):
-    """Эндпоинт для безопасного создания ключей на серверах и активации подписки"""
-    
     logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!")
     
-    # 1. ПРОВЕРКА JWT ТОКЕНА SUPABASE
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return web.Response(text=json.dumps({"error": "Missing or invalid Authorization header"}), status=401, content_type='application/json')
@@ -134,7 +131,7 @@ async def handle_create_vpn(request):
         }
         
         async with ClientSession() as session:
-            # 2. ПРОВЕРКА ТОКЕНА ЧЕРЕЗ SUPABASE AUTH
+            # 1. Проверка JWT токена
             async with session.get(f"{SUPABASE_URL}/auth/v1/user", headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"}) as auth_resp:
                 if auth_resp.status != 200:
                     logging.warning(f"Недействительный токен. Статус: {auth_resp.status}")
@@ -143,12 +140,11 @@ async def handle_create_vpn(request):
                 auth_data = await auth_resp.json()
                 real_user_id = auth_data.get('id')
 
-                # Проверяем, что ID из токена совпадает с тем, что просят активировать
                 if real_user_id != user_id:
                     logging.warning(f"Попытка подмены userId! Токен: {real_user_id}, Запрос: {user_id}")
                     return web.Response(text=json.dumps({"error": "User ID mismatch"}), status=403, content_type='application/json')
 
-            # 3. ПОЛУЧАЕМ EMAIL И ТЕКУЩУЮ ДАТУ ОКОНЧАНИЯ ПОДПИСКИ
+            # 2. Получаем email и текущую дату подписки
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
                 profile_data = await resp.json()
                 user_email = profile_data[0].get('email', 'user') if profile_data else "user"
@@ -156,15 +152,29 @@ async def handle_create_vpn(request):
             
             safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
             client_name = safe_email
+
+            # 3. Считаем новую дату и дни для панели H1Cloud
+            now = datetime.now(timezone.utc)
+            if current_expires_str:
+                current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
+                base_date = current_expires if current_expires > now else now
+            else:
+                base_date = now
             
-            # 4. ПОЛУЧАЕМ СПИСОК СЕРВЕРОВ
+            new_expires = base_date + timedelta(days=days)
+            new_expires_iso = new_expires.isoformat()
+
+            # Общее количество дней (остаток + купленные) для H1Cloud
+            total_days_for_panel = max(1, (new_expires - now).days)
+
+            # 4. Получаем сервера
             async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
                 servers = await resp.json()
 
             generated_urls = {}
             client_uuid = str(uuid.uuid4())
 
-            # 5. СОЗДАНИЕ КЛИЕНТОВ НА H1CLOUD
+            # 5. Создаем клиентов
             async def create_on_server(server):
                 api_url = server['api_url']
                 api_token = server['api_token']
@@ -177,20 +187,17 @@ async def handle_create_vpn(request):
                     "X-API-Key": api_token
                 }
 
-                # Удаляем старого клиента (защита от дублей)
                 try:
                     encoded_name = quote(client_name, safe='')
                     async with session.delete(f"{base_url}/clients/{encoded_name}", headers=headers_xui, timeout=5) as del_resp:
-                        if del_resp.status not in [200, 204, 404]:
-                            logging.warning(f"Не удалось удалить старого клиента {client_name} на {server['name']}: {del_resp.status}")
-                except Exception as e:
-                    logging.warning(f"Ошибка при удалении на {server['name']}: {e}")
+                        pass 
+                except Exception:
+                    pass
 
-                # Создаем нового
                 payload = {
                     "name": client_name,
                     "uuid": client_uuid,
-                    "days": days,
+                    "days": total_days_for_panel,
                     "inbound_ids": [inbound_id]
                 }
 
@@ -223,18 +230,7 @@ async def handle_create_vpn(request):
             if not generated_urls:
                 return web.Response(text=json.dumps({"error": "Все сервера недоступны"}), status=500, content_type='application/json')
 
-            # 6. НАЧИСЛЕНИЕ ДНЕЙ ПОДПИСКИ (Race Condition Fix)
-            now = datetime.now(timezone.utc)
-            if current_expires_str:
-                current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
-                base_date = current_expires if current_expires > now else now
-            else:
-                base_date = now
-            
-            new_expires = base_date + timedelta(days=days)
-            new_expires_iso = new_expires.isoformat()
-
-            # 7. СОХРАНЕНИЕ КЛЮЧЕЙ И ПОДПИСКИ В БАЗУ
+            # 6. Обновляем базу
             update_data = {
                 "vless_urls": generated_urls,
                 "subscription_plan": "premium",
