@@ -35,6 +35,7 @@ dp.include_router(router)
 
 class UserState(StatesGroup):
     waiting_for_email_buy = State()
+    confirming_email_buy = State()
     waiting_for_email_status = State()
 
 user_temp_data = {}
@@ -94,8 +95,37 @@ async def ask_email_for_buy(callback: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_for_email_buy)
 async def process_email_for_buy(message: Message, state: FSMContext):
     email = message.text.strip().lower()
-    await state.clear()
     
+    # Сохраняем email во временные данные и переходим к подтверждению
+    user_temp_data[message.from_user.id] = {"email": email}
+    await state.set_state(UserState.confirming_email_buy)
+    
+    await message.answer(
+        f"📧 Вы ввели: <b>{email}</b>\n\n"
+        f"Все верно? Если да, нажмите кнопку ниже. Если ошиблись — введите email заново.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, все верно", callback_data="confirm_email_yes")],
+            [InlineKeyboardButton(text="❌ Нет, ввести заново", callback_data="confirm_email_no")]
+        ])
+    )
+
+@router.callback_query(F.data == "confirm_email_no")
+async def confirm_email_no(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserState.waiting_for_email_buy)
+    await callback.message.edit_text(
+        "📧 <b>Введите ваш Email</b> заново:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]])
+    )
+
+@router.callback_query(F.data == "confirm_email_yes")
+async def confirm_email_yes(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    email = user_temp_data.get(callback.from_user.id, {}).get("email")
+    
+    if not email:
+        await callback.message.edit_text("❌ Ошибка сессии. Начните заново.", reply_markup=get_user_menu())
+        return
+
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
@@ -106,11 +136,11 @@ async def process_email_for_buy(message: Message, state: FSMContext):
             data = await resp.json()
             
     if data:
-        user_temp_data[message.from_user.id] = data[0]['id']
+        user_temp_data[callback.from_user.id]["target_id"] = data[0]['id']
     else:
-        user_temp_data[message.from_user.id] = f"waiting_{email}"
+        user_temp_data[callback.from_user.id]["target_id"] = f"waiting_{email}"
         
-    await show_plans(message)
+    await show_plans(callback.message)
 
 async def show_plans(message: Message):
     headers_sb = {
@@ -145,7 +175,7 @@ async def process_payment(callback: CallbackQuery):
     days = int(days_str)
     amount = float(amount_str)
     
-    target_id = user_temp_data.get(callback.from_user.id)
+    target_id = user_temp_data.get(callback.from_user.id, {}).get("target_id")
     
     if not target_id:
         await callback.message.edit_text("❌ Сессия истекла. Пожалуйста, начните заново.", reply_markup=get_user_menu())
@@ -157,8 +187,8 @@ async def process_payment(callback: CallbackQuery):
         "Content-Type": "application/json"
     }
     
-    # ИСПРАВЛЕНО: Используем | как разделитель, так как в email может быть _
-    order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}"
+    # Добавляем chat_id в order_id для отправки уведомления после оплаты!
+    order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}"
     
     payload = {
         "amount": int(amount),
@@ -428,7 +458,6 @@ async def handle_create_amypay_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        # ИСПРАВЛЕНО: Используем | как разделитель
         order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}"
         
         api_url = "https://amypay.ru/api/v2/orders"
@@ -467,11 +496,11 @@ async def handle_amypay_webhook(request):
         external_order_id = data.get('external_order_id')
         
         if external_order_id:
-            # ИСПРАВЛЕНО: Разделяем по |
             parts = external_order_id.split('|')
             if len(parts) >= 2:
                 target_id = parts[0]
                 days = int(parts[1])
+                chat_id = int(parts[3]) if len(parts) > 3 else None # Получаем chat_id
                 
                 if target_id.startswith("waiting_"):
                     email = target_id.replace("waiting_", "")
@@ -487,8 +516,22 @@ async def handle_amypay_webhook(request):
                     async with ClientSession() as session:
                         payload = {"email": email, "days": days}
                         await session.post(f"{SUPABASE_URL}/rest/v1/pending_payments", json=payload, headers=headers_sb)
+                        
+                    if chat_id:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ <b>Оплата получена!</b>\n\n"
+                                 "Мы сохранили вашу подписку. Она начислится автоматически, как только вы зарегистрируетесь в приложении с этим email."
+                        )
                 else:
                     asyncio.create_task(process_successful_payment(target_id, days))
+                    
+                    if chat_id:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ <b>Оплата успешно получена!</b>\n\n"
+                                 "Ваша подписка активирована. Откройте приложение EchoVPN, обновите экран подписки, и вы увидите новые дни."
+                        )
                     
                 return web.Response(text="OK", status=200)
         
