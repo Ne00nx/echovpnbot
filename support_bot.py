@@ -35,7 +35,6 @@ dp.include_router(router)
 
 class UserState(StatesGroup):
     waiting_for_email_status = State()
-    waiting_for_email_keys = State()
 
 admin_reply_map = {}
 
@@ -57,7 +56,6 @@ def get_user_menu():
     keyboard = [
         [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="buy_menu")],
         [InlineKeyboardButton(text="👤 Моя подписка", callback_data="check_status")],
-        [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="get_keys")],
         [InlineKeyboardButton(text="📥 Скачать приложение", url=APK_URL)],
         [InlineKeyboardButton(text="💬 Помощь", callback_data="help_mode")]
     ]
@@ -68,7 +66,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"👋 <b>Добро пожаловать в EchoVPN!</b>\n\n"
-        f"Здесь вы можете управлять своей подпиской, получать ключи и покупать доступ.\n\n"
+        f"Здесь вы можете управлять своей подпиской и покупать доступ.\n\n"
         f"Выберите действие ниже:",
         reply_markup=get_user_menu()
     )
@@ -198,42 +196,6 @@ async def process_email_status(message: Message, state: FSMContext):
         "❌ <b>Подписка не активна.</b>\n\nВы можете приобрести её в главном меню.",
         reply_markup=get_user_menu()
     )
-
-@router.callback_query(F.data == "get_keys")
-async def ask_email_keys(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserState.waiting_for_email_keys)
-    await callback.message.edit_text(
-        "📧 <b>Введите ваш Email</b>, чтобы получить ваши ключи.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]])
-    )
-
-@router.message(UserState.waiting_for_email_keys)
-async def process_email_keys(message: Message, state: FSMContext):
-    email = message.text.strip()
-    await state.clear()
-    
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
-    
-    async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=vless_urls", headers=headers_sb) as resp:
-            data = await resp.json()
-            
-    if not data or not data[0].get('vless_urls'):
-        await message.answer("❌ Ключи не найдены. Возможно, у вас нет активной подписки.", reply_markup=get_user_menu())
-        return
-        
-    vless_urls = data[0]['vless_urls']
-    text = "🔑 <b>Ваши ключи подключения:</b>\n\n"
-    
-    for server_id, url in vless_urls.items():
-        text += f"<code>{url}</code>\n\n"
-        
-    text += "Скопируйте нужный ключ и вставьте его в приложение."
-    
-    await message.answer(text, reply_markup=get_user_menu())
 
 @router.callback_query(F.data == "help_mode")
 async def help_mode(callback: CallbackQuery, state: FSMContext):
