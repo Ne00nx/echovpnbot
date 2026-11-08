@@ -9,13 +9,10 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web, ClientSession
 
-# ==========================================
-# НАСТРОЙКИ
-# ==========================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ' 
@@ -25,10 +22,8 @@ OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
-# --- НАСТРОЙКИ AMYPAY ---
 AMYPAY_API_KEY = os.getenv('AMYPAY_API_KEY', '')
 AMYPAY_SECRET_WORD_2 = os.getenv('AMYPAY_SECRET_WORD_2', '')
-# ==========================================
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -36,17 +31,19 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
 
+admin_reply_map = {}
+
 async def check_amypay_token():
+    if not AMYPAY_API_KEY: return
     url = "https://amypay.ru/api/v2/ping"
     headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}"}
     try:
         async with ClientSession() as session:
             async with session.get(url, headers=headers, timeout=5) as resp:
-                text = await resp.text()
                 if resp.status == 200:
-                    logging.info(f"✅ Amypay API ключ валиден! Ответ: {text}")
+                    logging.info(f"Amypay API ключ валиден!")
                 else:
-                    logging.error(f"❌ Amypay API ключ НЕВАЛИДЕН! Статус: {resp.status}, Ответ: {text}")
+                    logging.error(f"Amypay API ключ НЕВАЛИДЕН! Статус: {resp.status}")
     except Exception as e:
         logging.error(f"Ошибка проверки ключа Amypay: {e}")
 
@@ -82,22 +79,69 @@ async def show_docs(callback: CallbackQuery):
 async def help_mode(callback: CallbackQuery):
     await callback.message.edit_text("💬 Вы перешли в режим поддержки.\n\nОпишите вашу проблему одним сообщением, и мы ответим вам в ближайшее время.")
 
-@router.message()
+@router.message(Command("give_days"), F.from_user.id == ADMIN_ID)
+async def cmd_give_days(message: Message):
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("⚠️ Использование: <code>/give_days email@example.com 30</code>")
+        return
+
+    email = args[1]
+    try:
+        days = int(args[2])
+    except ValueError:
+        await message.answer("⚠️ Количество дней должно быть числом.")
+        return
+
+    await message.answer(f"⏳ Ищу пользователя {email} и начисляю {days} дней...")
+
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+            data = await resp.json()
+            if not data:
+                await message.answer("❌ Пользователь с таким email не найден.")
+                return
+            user_id = data[0]['id']
+
+    await process_successful_payment(user_id, days)
+    await message.answer(f"✅ Подписка на {days} дней успешно выдана для {email}!")
+
+@router.message(F.chat.id != ADMIN_ID)
 async def forward_to_admin(message: Message):
     user = message.from_user
     safe_name = html.escape(user.full_name)
-    safe_text = html.escape(message.text) if message.text else "Нет текста (возможно, вложение)"
     
-    admin_text = (
+    admin_text_header = (
         f"<b>📩 Новое сообщение в поддержку</b>\n\n"
         f"👤 От: {safe_name}\n"
         f"🆔 ID: <code>{user.id}</code>\n"
         f"🔗 Username: @{user.username or 'нет'}\n\n"
-        f"💬 Текст:\n{safe_text}"
     )
     
     try:
-        await bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+        sent_msg = None
+        if message.text:
+            text = html.escape(message.text)
+            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + f"💬 Текст:\n{text}")
+        elif message.photo:
+            caption = html.escape(message.caption) if message.caption else "Без подписи"
+            sent_msg = await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=admin_text_header + f"🖼 Фото:\n{caption}")
+        elif message.document:
+            caption = html.escape(message.caption) if message.caption else "Без подписи"
+            sent_msg = await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=admin_text_header + f"📄 Документ:\n{caption}")
+        elif message.video:
+            sent_msg = await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=admin_text_header + "🎥 Видео")
+        else:
+            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + "❓ Неизвестный тип сообщения")
+
+        if sent_msg:
+            admin_reply_map[sent_msg.message_id] = user.id
+            
         await message.answer("✅ Ваше сообщение передано в поддержку. Ожидайте ответа.")
     except Exception as e:
         logging.error(f"Ошибка отправки админу: {e}")
@@ -105,24 +149,25 @@ async def forward_to_admin(message: Message):
 
 @router.message(F.chat.id == ADMIN_ID, F.reply_to_message)
 async def reply_to_user(message: Message):
+    reply_to_msg_id = message.reply_to_message.message_id
+    target_user_id = admin_reply_map.get(reply_to_msg_id)
+
+    if not target_user_id:
+        await message.answer("❌ Не могу определить, кому отправить этот ответ. Возможно, сообщение слишком старое или было отправлено не через бота.")
+        return
+
     try:
-        original_text = message.reply_to_message.text
-        if original_text and "🆔 ID: <code>" in original_text:
-            user_id_str = original_text.split("🆔 ID: <code>")[1].split("</code>")[0]
-            user_id = int(user_id_str)
+        if message.text:
             safe_reply = html.escape(message.text)
-            await bot.send_message(
-                chat_id=user_id,
-                text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}"
-            )
+            await bot.send_message(chat_id=target_user_id, text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}")
             await message.answer("✅ Ответ отправлен пользователю.")
         else:
-            await message.answer("❌ Не удалось найти ID пользователя в сообщении.")
+            await message.answer("⚠️ Пожалуйста, отвечайте пользователю текстом. Отправка медиа в ответ пока не поддерживается.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка при отправке: {e}")
+        await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
 async def process_successful_payment(user_id, days):
-    logging.info(f"🚀 Активация подписки для {user_id} на {days} дней")
+    logging.info(f"Активация подписки для {user_id} на {days} дней")
     
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -132,8 +177,11 @@ async def process_successful_payment(user_id, days):
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
             profile_data = await resp.json()
-            user_email = profile_data[0].get('email', 'user') if profile_data else "user"
-            current_expires_str = profile_data[0].get('subscription_expires_at') if profile_data else None
+            if not profile_data:
+                logging.error(f"Профиль {user_id} не найден.")
+                return
+            user_email = profile_data[0].get('email', 'user')
+            current_expires_str = profile_data[0].get('subscription_expires_at')
         
         safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
         client_name = safe_email
@@ -203,7 +251,7 @@ async def process_successful_payment(user_id, days):
                 if resp.status not in [200, 204]:
                     logging.error(f"Ошибка Supabase: {await resp.text()}")
                 else:
-                    logging.info(f"✅ Подписка для {user_id} успешно активирована!")
+                    logging.info(f"Подписка для {user_id} успешно активирована!")
 
 async def handle_create_amypay_payment(request):
     try:
@@ -261,37 +309,25 @@ async def handle_create_amypay_payment(request):
         logging.error(f"Критическая ошибка создания платежа: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
-# ==========================================
-# ВЕБХУК ОТ AMYPAY (ИСПРАВЛЕННЫЙ)
-# ==========================================
 async def handle_amypay_webhook(request):
     try:
         data = await request.post()
         logging.info(f"Получен вебхук от Amypay: {data}")
         
-        # В вебхуке поле называется 'sign', а не 'signature'
         sign = data.get('sign')
         order_number = data.get('order_number')
-        amount = data.get('amount')
         external_order_id = data.get('external_order_id')
         
-        # Проверка подписи (если она передана)
-        if sign:
-            # В документации Amypay подпись вебхука обычно считается как sha256(api_key + amount + secret_2)
-            # Но точный формат лучше уточнить в поддержке. Пока просто логируем, что она есть.
-            logging.info(f"✅ Получена подпись вебхука: {sign}")
-        
-        # Если пришел external_order_id, значит оплата прошла (Amypay присылает вебхук только при успехе)
         if external_order_id:
             parts = external_order_id.split('_')
             if len(parts) >= 2:
                 user_id = parts[0]
                 days = int(parts[1])
                 asyncio.create_task(process_successful_payment(user_id, days))
-                logging.info(f"✅ Оплата по заказу {order_number} успешна! Запущена активация для {user_id} на {days} дней.")
+                logging.info(f"Оплата по заказу {order_number} успешна! Запущена активация для {user_id} на {days} дней.")
                 return web.Response(text="OK", status=200)
         
-        logging.warning(f"❌ Не удалось распознать данные вебхука: {data}")
+        logging.warning(f"Не удалось распознать данные вебхука: {data}")
         return web.Response(text="OK", status=200)
 
     except Exception as e:
