@@ -10,6 +10,9 @@ from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web, ClientSession
 
+# ==========================================
+# НАСТРОЙКИ
+# ==========================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.hexed.pw/d/II9QBaio8oE8jQ' 
@@ -18,6 +21,7 @@ OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+# ==========================================
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -96,6 +100,9 @@ async def reply_to_user(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке: {e}")
 
+# ==========================================
+# ВЕБ-СЕРВЕР И API ДЛЯ СОЗДАНИЯ VPN
+# ==========================================
 async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
 
@@ -115,11 +122,23 @@ async def handle_create_vpn(request):
         }
         
         async with ClientSession() as session:
+            # 1. Получаем профиль пользователя (чтобы взять email для понятного имени)
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email", headers=headers_sb) as resp:
+                profile_data = await resp.json()
+                user_email = profile_data[0]['email'] if profile_data else "user"
+            
+            # Делаем безопасное имя для панели (убираем @ и точки)
+            safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
+            
+            # 2. Получаем список серверов из Supabase
             async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
                 servers = await resp.json()
 
             generated_urls = {}
+            # Генерируем UUID один раз для всех серверов
             client_uuid = str(uuid.uuid4())
+            # Имя клиента в панели: например, walpas666_803b
+            client_name = f"{safe_email}_{client_uuid[:4]}"
 
             async def create_on_server(server):
                 api_url = server['api_url']
@@ -127,7 +146,7 @@ async def handle_create_vpn(request):
                 inbound_id = server['inbound_id']
                 
                 payload = {
-                    "name": f"user_{client_uuid[:8]}",
+                    "name": client_name,
                     "uuid": client_uuid,
                     "days": days,
                     "inbound_ids": [inbound_id]
@@ -140,6 +159,7 @@ async def handle_create_vpn(request):
                 }
 
                 try:
+                    # Таймаут 5 секунд на каждый сервер
                     async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
                         if resp.status in [200, 201]:
                             domain = server['domain']
@@ -158,6 +178,7 @@ async def handle_create_vpn(request):
                     logging.error(f"Сетевая ошибка на сервере {server['name']}: {e}")
                     return None
 
+            # Запускаем запросы одновременно
             tasks = [create_on_server(s) for s in servers]
             results = await asyncio.gather(*tasks)
 
@@ -169,6 +190,7 @@ async def handle_create_vpn(request):
             if not generated_urls:
                 return web.Response(text=json.dumps({"error": "Все сервера недоступны"}), status=500, content_type='application/json')
 
+            # Сохраняем результат в профиль
             update_data = {"vless_urls": generated_urls}
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
             
@@ -196,6 +218,11 @@ async def start_web_server():
     await site.start()
 
 async def main():
+    # Пауза 10 секунд, чтобы Render успел убить старый контейнер
+    # и Telegram не выдавал ошибку Conflict (два бота одновременно)
+    logging.info("Ожидание завершения старого деплоя (10 сек)...")
+    await asyncio.sleep(10)
+    
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
