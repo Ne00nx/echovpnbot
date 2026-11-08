@@ -157,7 +157,8 @@ async def process_payment(callback: CallbackQuery):
         "Content-Type": "application/json"
     }
     
-    order_id = f"{target_id}_{days}_{int(datetime.now().timestamp())}"
+    # ИСПРАВЛЕНО: Используем | как разделитель, так как в email может быть _
+    order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}"
     
     payload = {
         "amount": int(amount),
@@ -427,7 +428,8 @@ async def handle_create_amypay_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
+        # ИСПРАВЛЕНО: Используем | как разделитель
+        order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}"
         
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {
@@ -465,7 +467,8 @@ async def handle_amypay_webhook(request):
         external_order_id = data.get('external_order_id')
         
         if external_order_id:
-            parts = external_order_id.split('_')
+            # ИСПРАВЛЕНО: Разделяем по |
+            parts = external_order_id.split('|')
             if len(parts) >= 2:
                 target_id = parts[0]
                 days = int(parts[1])
