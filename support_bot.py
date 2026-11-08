@@ -111,20 +111,17 @@ async def handle(request):
 async def handle_create_vpn(request):
     logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!")
     
-    # ДИАГНОСТИКА 1: Проверяем, дошел ли заголовок
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
-        logging.error(f"❌ ОШИБКА: Заголовок Authorization отсутствует или неверного формата. Получено: {auth_header}")
+        logging.error(f"❌ ОШИБКА: Заголовок Authorization отсутствует. Получено: {auth_header}")
         return web.Response(text=json.dumps({"error": "Missing or invalid Authorization header"}), status=401, content_type='application/json')
     
     token = auth_header.split(' ')[1]
-    logging.info(f"✅ Заголовок получен. Токен начинается с: {token[:15]}...")
 
     try:
         data = await request.json()
         user_id = data.get('userId')
         days = data.get('days', 30)
-        logging.info(f"📦 Данные из запроса: userId={user_id}, days={days}")
 
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
@@ -135,7 +132,7 @@ async def handle_create_vpn(request):
         }
         
         async with ClientSession() as session:
-            # ДИАГНОСТИКА 2: Проверяем токен через Supabase
+            # Проверка токена
             sb_url = SUPABASE_URL.rstrip('/')
             auth_url = f"{sb_url}/auth/v1/user"
             
@@ -147,13 +144,12 @@ async def handle_create_vpn(request):
                 
                 auth_data = await auth_resp.json()
                 real_user_id = auth_data.get('id')
-                logging.info(f"✅ Токен валиден. Пользователь: {real_user_id}")
 
                 if real_user_id != user_id:
                     logging.error(f"❌ ОШИБКА: Несовпадение ID! В токене: {real_user_id}, В запросе: {user_id}")
                     return web.Response(text=json.dumps({"error": "User ID mismatch"}), status=403, content_type='application/json')
 
-            # 3. Получаем email и текущую дату подписки
+            # Получаем email и текущую дату подписки
             async with session.get(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
                 profile_data = await resp.json()
                 user_email = profile_data[0].get('email', 'user') if profile_data else "user"
@@ -162,7 +158,7 @@ async def handle_create_vpn(request):
             safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
             client_name = safe_email
 
-            # 4. Считаем новую дату и дни для панели H1Cloud
+            # Считаем новую дату
             now = datetime.now(timezone.utc)
             if current_expires_str:
                 current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
@@ -175,14 +171,14 @@ async def handle_create_vpn(request):
 
             total_days_for_panel = max(1, (new_expires - now).days)
 
-            # 5. Получаем сервера
+            # Получаем сервера
             async with session.get(f"{sb_url}/rest/v1/servers?select=*", headers=headers_sb) as resp:
                 servers = await resp.json()
 
             generated_urls = {}
             client_uuid = str(uuid.uuid4())
 
-            # 6. Создаем клиентов
+            # Создаем клиентов
             async def create_on_server(server):
                 api_url = server['api_url']
                 api_token = server['api_token']
@@ -216,7 +212,12 @@ async def handle_create_vpn(request):
                             pbk = server['pbk']
                             sid = server['sid']
                             
-                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
+                            # ХИТРОСТЬ: Для Испании (ES) генерируем ссылку БЕЗ flow
+                            if server.get('country_code') == 'ES':
+                                vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none#EchoVPN-{server['name']}"
+                            else:
+                                vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
+                            
                             vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
                             return server['id'], vless_url
                         else:
@@ -238,7 +239,7 @@ async def handle_create_vpn(request):
             if not generated_urls:
                 return web.Response(text=json.dumps({"error": "Все сервера недоступны"}), status=500, content_type='application/json')
 
-            # 7. Обновляем базу
+            # Обновляем базу
             update_data = {
                 "vless_urls": generated_urls,
                 "subscription_plan": "premium",
