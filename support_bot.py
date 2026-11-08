@@ -16,7 +16,7 @@ from aiohttp import web, ClientSession
 # ==========================================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
-APK_URL = 'https://disk.hexed.pw/d/II9QBaio8oE8jQ' 
+APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ' 
 PRIVACY_URL = 'https://telegra.ph/Politika-konfidencialnosti-EchoVPN-11-07'
 OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 
