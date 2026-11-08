@@ -11,6 +11,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web, ClientSession
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -31,6 +33,10 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
 
+class UserState(StatesGroup):
+    waiting_for_email_status = State()
+    waiting_for_email_keys = State()
+
 admin_reply_map = {}
 
 async def check_amypay_token():
@@ -41,43 +47,202 @@ async def check_amypay_token():
         async with ClientSession() as session:
             async with session.get(url, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
-                    logging.info(f"Amypay API ключ валиден!")
+                    logging.info("Amypay API ключ валиден!")
                 else:
                     logging.error(f"Amypay API ключ НЕВАЛИДЕН! Статус: {resp.status}")
     except Exception as e:
         logging.error(f"Ошибка проверки ключа Amypay: {e}")
 
-def get_main_menu():
+def get_user_menu():
     keyboard = [
+        [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="buy_menu")],
+        [InlineKeyboardButton(text="👤 Моя подписка", callback_data="check_status")],
+        [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="get_keys")],
         [InlineKeyboardButton(text="📥 Скачать приложение", url=APK_URL)],
-        [InlineKeyboardButton(text="📄 Документы", callback_data="docs_menu")],
-        [InlineKeyboardButton(text="🆘 Помощь", callback_data="help_mode")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def get_docs_menu():
-    keyboard = [
-        [InlineKeyboardButton(text="Политика конфиденциальности", url=PRIVACY_URL)],
-        [InlineKeyboardButton(text="Пользовательское соглашение", url=OFFER_URL)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(text="💬 Помощь", callback_data="help_mode")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    await message.answer("👋 Добро пожаловать в EchoVPN!\n\nВыберите нужный раздел:", reply_markup=get_main_menu())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        f"👋 <b>Добро пожаловать в EchoVPN!</b>\n\n"
+        f"Здесь вы можете управлять своей подпиской, получать ключи и покупать доступ.\n\n"
+        f"Выберите действие ниже:",
+        reply_markup=get_user_menu()
+    )
 
 @router.callback_query(F.data == "main_menu")
-async def back_to_main(callback: CallbackQuery):
-    await callback.message.edit_text("👋 Добро пожаловать в EchoVPN!\n\nВыберите нужный раздел:", reply_markup=get_main_menu())
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        f"👋 <b>Главное меню EchoVPN</b>\n\nВыберите действие:",
+        reply_markup=get_user_menu()
+    )
 
-@router.callback_query(F.data == "docs_menu")
-async def show_docs(callback: CallbackQuery):
-    await callback.message.edit_text("📄 Выберите документ для ознакомления:", reply_markup=get_docs_menu())
+@router.callback_query(F.data == "buy_menu")
+async def show_buy_menu(callback: CallbackQuery):
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+    
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/plans?is_active=eq.true&order=duration_days.asc", headers=headers_sb) as resp:
+            plans = await resp.json()
+
+    if not plans:
+        await callback.message.edit_text("❌ Тарифы временно недоступны.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
+        return
+
+    keyboard = []
+    for plan in plans:
+        keyboard.append([InlineKeyboardButton(
+            text=f"{plan['name']} — {plan['price_rub']} ₽", 
+            callback_data=f"pay_{plan['duration_days']}_{plan['price_rub']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+    await callback.message.edit_text(
+        "💳 <b>Выберите тариф для покупки:</b>\n\nПосле нажатия кнопки вы получите ссылку на оплату.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+@router.callback_query(F.data.startswith("pay_"))
+async def process_payment(callback: CallbackQuery):
+    _, days_str, amount_str = callback.data.split("_")
+    days = int(days_str)
+    amount = float(amount_str)
+    
+    user_id = str(callback.from_user.id)
+    
+    api_url = "https://amypay.ru/api/v2/orders"
+    headers = {
+        "Authorization": f"Bearer {AMYPAY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
+    
+    payload = {
+        "amount": int(amount),
+        "external_order_id": order_id,
+        "description": f"EchoVPN Subscription ({days} days)"
+    }
+    
+    async with ClientSession() as session:
+        async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
+            resp_data = await resp.json()
+            
+            if resp.status in [200, 201] and resp_data.get('ok'):
+                pay_url = resp_data.get('order', {}).get('pay_url')
+                if pay_url:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
+                    ])
+                    await callback.message.edit_text(
+                        f"✅ Заказ на <b>{days} дней</b> (Сумма: {amount} ₽) создан!\n\n"
+                        f"Нажмите кнопку ниже, чтобы оплатить.",
+                        reply_markup=keyboard
+                    )
+                    return
+    
+    await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
+
+@router.callback_query(F.data == "check_status")
+async def ask_email_status(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserState.waiting_for_email_status)
+    await callback.message.edit_text(
+        "📧 <b>Введите ваш Email</b>, который вы указывали при регистрации в приложении.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]])
+    )
+
+@router.message(UserState.waiting_for_email_status)
+async def process_email_status(message: Message, state: FSMContext):
+    email = message.text.strip()
+    await state.clear()
+    
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+    
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=subscription_plan,subscription_expires_at", headers=headers_sb) as resp:
+            data = await resp.json()
+            
+    if not data:
+        await message.answer("❌ Пользователь с таким email не найден.", reply_markup=get_user_menu())
+        return
+        
+    profile = data[0]
+    expires_at_str = profile.get('subscription_expires_at')
+    plan = profile.get('subscription_plan')
+    
+    if plan == 'premium' and expires_at_str:
+        expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        if expires_at > now:
+            days_left = (expires_at - now).days
+            await message.answer(
+                f"✅ <b>Подписка активна!</b>\n\n"
+                f"📅 Осталось дней: <b>{days_left}</b>\n"
+                f"⏳ Действует до: <b>{expires_at.strftime('%d.%m.%Y')}</b>",
+                reply_markup=get_user_menu()
+            )
+            return
+            
+    await message.answer(
+        "❌ <b>Подписка не активна.</b>\n\nВы можете приобрести её в главном меню.",
+        reply_markup=get_user_menu()
+    )
+
+@router.callback_query(F.data == "get_keys")
+async def ask_email_keys(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserState.waiting_for_email_keys)
+    await callback.message.edit_text(
+        "📧 <b>Введите ваш Email</b>, чтобы получить ваши ключи.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]])
+    )
+
+@router.message(UserState.waiting_for_email_keys)
+async def process_email_keys(message: Message, state: FSMContext):
+    email = message.text.strip()
+    await state.clear()
+    
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+    
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=vless_urls", headers=headers_sb) as resp:
+            data = await resp.json()
+            
+    if not data or not data[0].get('vless_urls'):
+        await message.answer("❌ Ключи не найдены. Возможно, у вас нет активной подписки.", reply_markup=get_user_menu())
+        return
+        
+    vless_urls = data[0]['vless_urls']
+    text = "🔑 <b>Ваши ключи подключения:</b>\n\n"
+    
+    for server_id, url in vless_urls.items():
+        text += f"<code>{url}</code>\n\n"
+        
+    text += "Скопируйте нужный ключ и вставьте его в приложение."
+    
+    await message.answer(text, reply_markup=get_user_menu())
 
 @router.callback_query(F.data == "help_mode")
-async def help_mode(callback: CallbackQuery):
-    await callback.message.edit_text("💬 Вы перешли в режим поддержки.\n\nОпишите вашу проблему одним сообщением, и мы ответим вам в ближайшее время.")
+async def help_mode(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "💬 <b>Режим поддержки</b>\n\n"
+        "Опишите вашу проблему одним сообщением (можно прикрепить фото). Мы ответим вам в ближайшее время.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
+    )
 
 @router.message(Command("give_days"), F.from_user.id == ADMIN_ID)
 async def cmd_give_days(message: Message):
@@ -112,7 +277,11 @@ async def cmd_give_days(message: Message):
     await message.answer(f"✅ Подписка на {days} дней успешно выдана для {email}!")
 
 @router.message(F.chat.id != ADMIN_ID)
-async def forward_to_admin(message: Message):
+async def forward_to_admin(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
     user = message.from_user
     safe_name = html.escape(user.full_name)
     
@@ -153,7 +322,7 @@ async def reply_to_user(message: Message):
     target_user_id = admin_reply_map.get(reply_to_msg_id)
 
     if not target_user_id:
-        await message.answer("❌ Не могу определить, кому отправить этот ответ. Возможно, сообщение слишком старое или было отправлено не через бота.")
+        await message.answer("❌ Не могу определить, кому отправить этот ответ.")
         return
 
     try:
@@ -162,7 +331,7 @@ async def reply_to_user(message: Message):
             await bot.send_message(chat_id=target_user_id, text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}")
             await message.answer("✅ Ответ отправлен пользователю.")
         else:
-            await message.answer("⚠️ Пожалуйста, отвечайте пользователю текстом. Отправка медиа в ответ пока не поддерживается.")
+            await message.answer("⚠️ Пожалуйста, отвечайте текстом.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
@@ -178,7 +347,6 @@ async def process_successful_payment(user_id, days):
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
-                logging.error(f"Профиль {user_id} не найден.")
                 return
             user_email = profile_data[0].get('email', 'user')
             current_expires_str = profile_data[0].get('subscription_expires_at')
@@ -232,8 +400,7 @@ async def process_successful_payment(user_id, days):
                         
                         vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
                         return server['id'], vless_url
-            except Exception as e:
-                logging.error(f"Сетевая ошибка на {server['name']}: {e}")
+            except Exception: pass
             return None
 
         tasks = [create_on_server(s) for s in servers]
@@ -250,8 +417,6 @@ async def process_successful_payment(user_id, days):
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
                 if resp.status not in [200, 204]:
                     logging.error(f"Ошибка Supabase: {await resp.text()}")
-                else:
-                    logging.info(f"Подписка для {user_id} успешно активирована!")
 
 async def handle_create_amypay_payment(request):
     try:
@@ -279,43 +444,25 @@ async def handle_create_amypay_payment(request):
         
         async with ClientSession() as session:
             async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
-                resp_text = await resp.text()
-                logging.info(f"Ответ от Amypay API (статус {resp.status}): {resp_text}")
-                
-                if 'application/json' not in resp.content_type:
-                    return web.Response(text=json.dumps({"error": "Amypay API вернул HTML вместо JSON"}), status=500, content_type='application/json')
-
                 resp_data = await resp.json()
                 
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    order_data = resp_data.get('order', {})
-                    pay_url = order_data.get('pay_url') or order_data.get('payment_url')
-                    
+                    pay_url = resp_data.get('order', {}).get('pay_url')
                     if pay_url:
                         return web.Response(
                             text=json.dumps({"payment_url": pay_url}),
                             status=200,
                             content_type='application/json'
                         )
-                    else:
-                        logging.error(f"В ответе нет ссылки на оплату: {resp_data}")
-                        return web.Response(text=json.dumps({"error": "No pay_url in response"}), status=500, content_type='application/json')
                 
-                error_msg = resp_data.get('error', 'Unknown error')
-                logging.error(f"Ошибка Amypay API: {error_msg}")
-                return web.Response(text=json.dumps({"error": error_msg}), status=500, content_type='application/json')
+                return web.Response(text=json.dumps({"error": "Failed to create order"}), status=500, content_type='application/json')
                 
     except Exception as e:
-        logging.error(f"Критическая ошибка создания платежа: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_amypay_webhook(request):
     try:
         data = await request.post()
-        logging.info(f"Получен вебхук от Amypay: {data}")
-        
-        sign = data.get('sign')
-        order_number = data.get('order_number')
         external_order_id = data.get('external_order_id')
         
         if external_order_id:
@@ -324,10 +471,8 @@ async def handle_amypay_webhook(request):
                 user_id = parts[0]
                 days = int(parts[1])
                 asyncio.create_task(process_successful_payment(user_id, days))
-                logging.info(f"Оплата по заказу {order_number} успешна! Запущена активация для {user_id} на {days} дней.")
                 return web.Response(text="OK", status=200)
         
-        logging.warning(f"Не удалось распознать данные вебхука: {data}")
         return web.Response(text="OK", status=200)
 
     except Exception as e:
@@ -347,7 +492,6 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    logging.info("Ожидание завершения старого деплоя (10 сек)...")
     await asyncio.sleep(10)
     await check_amypay_token()
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
