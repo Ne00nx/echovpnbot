@@ -140,7 +140,7 @@ async def handle_create_vpn(request):
                 }
 
                 try:
-                    async with session.post(api_url, json=payload, headers=headers_xui, timeout=10) as resp:
+                    async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
                         if resp.status in [200, 201]:
                             domain = server['domain']
                             pbk = server['pbk']
