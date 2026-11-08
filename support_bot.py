@@ -26,10 +26,10 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 # --- НАСТРОЙКИ AMYPAY ---
-# Твой новый токен из панели
-AMYPAY_API_KEY = "amy_account_b3ece4dea6d10fe507faeb26.afa6889ad6c20f0e84a1f20ce8652407466ca4a44e4e12a1b7dd815ce5b51f4d" 
-# ОБЯЗАТЕЛЬНО ВСТАВЬ СЕКРЕТНОЕ СЛОВО №2 ИЗ ПАНЕЛИ AMYPAY!
-AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8" 
+# Используем "Ключ кассы" из блока "Ключи доступа"
+AMYPAY_API_KEY = "197b0dc212cd479917d6f786b055353" 
+# Секретное слово №2 из панели Amypay (нажмите на глазик, чтобы скопировать)
+AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8"
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
@@ -209,7 +209,6 @@ async def handle_create_amypay_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        # Формируем уникальный ID заказа (user_id_days_timestamp)
         external_order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
         
         api_url = "https://amypay.ru/api/v2/orders"
@@ -245,7 +244,7 @@ async def handle_create_amypay_payment(request):
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 # ==========================================
-# ВЕБХУК ОТ AMYPAY (Прием уведомлений)
+# ВЕБХУК ОТ AMYPAY
 # ==========================================
 async def handle_amypay_webhook(request):
     try:
@@ -258,7 +257,6 @@ async def handle_amypay_webhook(request):
         external_order_id = data.get('external_order_id')
         signature = data.get('signature')
         
-        # Проверка подписи (согласно документации Amypay)
         if order_number and amount and signature:
             sign_str = f"{AMYPAY_API_KEY}:{order_number}:{amount}:{AMYPAY_SECRET_WORD_2}"
             expected_sign = hashlib.sha256(sign_str.encode()).hexdigest()
