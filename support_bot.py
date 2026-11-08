@@ -67,7 +67,7 @@ async def help_mode(callback: CallbackQuery):
 async def forward_to_admin(message: Message):
     user = message.from_user
     safe_name = html.escape(user.full_name)
-    safe_text = html.escape(message.text) if message.text else "Нет текста (возможно, фото или документ)"
+    safe_text = html.escape(message.text) if message.text else "Нет текста (возможно, вложение)"
     
     admin_text = (
         f"<b>📩 Новое сообщение в поддержку</b>\n\n"
@@ -98,7 +98,7 @@ async def reply_to_user(message: Message):
             )
             await message.answer("✅ Ответ отправлен пользователю.")
         else:
-            await message.answer("❌ Не удалось найти ID пользователя.")
+            await message.answer("❌ Не удалось найти ID пользователя в сообщении.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке: {e}")
 
@@ -111,16 +111,20 @@ async def handle(request):
 async def handle_create_vpn(request):
     logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!")
     
+    # ДИАГНОСТИКА 1: Проверяем, дошел ли заголовок
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
+        logging.error(f"❌ ОШИБКА: Заголовок Authorization отсутствует или неверного формата. Получено: {auth_header}")
         return web.Response(text=json.dumps({"error": "Missing or invalid Authorization header"}), status=401, content_type='application/json')
     
     token = auth_header.split(' ')[1]
+    logging.info(f"✅ Заголовок получен. Токен начинается с: {token[:15]}...")
 
     try:
         data = await request.json()
         user_id = data.get('userId')
         days = data.get('days', 30)
+        logging.info(f"📦 Данные из запроса: userId={user_id}, days={days}")
 
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
@@ -131,21 +135,26 @@ async def handle_create_vpn(request):
         }
         
         async with ClientSession() as session:
-            # 1. Проверка JWT токена
-            async with session.get(f"{SUPABASE_URL}/auth/v1/user", headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"}) as auth_resp:
+            # ДИАГНОСТИКА 2: Проверяем токен через Supabase
+            sb_url = SUPABASE_URL.rstrip('/')
+            auth_url = f"{sb_url}/auth/v1/user"
+            
+            async with session.get(auth_url, headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"}) as auth_resp:
                 if auth_resp.status != 200:
-                    logging.warning(f"Недействительный токен. Статус: {auth_resp.status}")
+                    err_body = await auth_resp.text()
+                    logging.error(f"❌ ОШИБКА SUPABASE AUTH: Статус {auth_resp.status}. Ответ: {err_body}")
                     return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
                 
                 auth_data = await auth_resp.json()
                 real_user_id = auth_data.get('id')
+                logging.info(f"✅ Токен валиден. Пользователь: {real_user_id}")
 
                 if real_user_id != user_id:
-                    logging.warning(f"Попытка подмены userId! Токен: {real_user_id}, Запрос: {user_id}")
+                    logging.error(f"❌ ОШИБКА: Несовпадение ID! В токене: {real_user_id}, В запросе: {user_id}")
                     return web.Response(text=json.dumps({"error": "User ID mismatch"}), status=403, content_type='application/json')
 
-            # 2. Получаем email и текущую дату подписки
-            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
+            # 3. Получаем email и текущую дату подписки
+            async with session.get(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
                 profile_data = await resp.json()
                 user_email = profile_data[0].get('email', 'user') if profile_data else "user"
                 current_expires_str = profile_data[0].get('subscription_expires_at') if profile_data else None
@@ -153,7 +162,7 @@ async def handle_create_vpn(request):
             safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
             client_name = safe_email
 
-            # 3. Считаем новую дату и дни для панели H1Cloud
+            # 4. Считаем новую дату и дни для панели H1Cloud
             now = datetime.now(timezone.utc)
             if current_expires_str:
                 current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
@@ -164,17 +173,16 @@ async def handle_create_vpn(request):
             new_expires = base_date + timedelta(days=days)
             new_expires_iso = new_expires.isoformat()
 
-            # Общее количество дней (остаток + купленные) для H1Cloud
             total_days_for_panel = max(1, (new_expires - now).days)
 
-            # 4. Получаем сервера
-            async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
+            # 5. Получаем сервера
+            async with session.get(f"{sb_url}/rest/v1/servers?select=*", headers=headers_sb) as resp:
                 servers = await resp.json()
 
             generated_urls = {}
             client_uuid = str(uuid.uuid4())
 
-            # 5. Создаем клиентов
+            # 6. Создаем клиентов
             async def create_on_server(server):
                 api_url = server['api_url']
                 api_token = server['api_token']
@@ -230,7 +238,7 @@ async def handle_create_vpn(request):
             if not generated_urls:
                 return web.Response(text=json.dumps({"error": "Все сервера недоступны"}), status=500, content_type='application/json')
 
-            # 6. Обновляем базу
+            # 7. Обновляем базу
             update_data = {
                 "vless_urls": generated_urls,
                 "subscription_plan": "premium",
@@ -238,10 +246,10 @@ async def handle_create_vpn(request):
             }
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
             
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
+            async with session.patch(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
                 if resp.status not in [200, 204]:
                     err = await resp.text()
-                    logging.error(f"Ошибка Supabase: {err}")
+                    logging.error(f"Ошибка Supabase при обновлении: {err}")
                     return web.Response(text=json.dumps({"error": f"Supabase error: {err}"}), status=500, content_type='application/json')
 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
