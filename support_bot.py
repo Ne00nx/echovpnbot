@@ -28,6 +28,7 @@ SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 # --- НАСТРОЙКИ CYBERBIZ ---
 CYBERBIZ_SHOP_ID = "1794171345"
 CYBERBIZ_SECRET = "SNB1QkaHLuVPZEpjd"
+# ОБЯЗАТЕЛЬНО ВСТАВЬ СЮДА ТОКЕН, КОТОРЫЙ ТЫ ВЫПУСТИЛ В ПАНЕЛИ CYBERBIZ
 CYBERBIZ_API_TOKEN = "hrdQmAgJBgGniZoQ" 
 # ==========================================
 
@@ -37,6 +38,9 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
 
+# ==========================================
+# ФУНКЦИИ TELEGRAM-БОТА
+# ==========================================
 def get_main_menu():
     keyboard = [
         [InlineKeyboardButton(text="📥 Скачать приложение", url=APK_URL)],
@@ -120,6 +124,7 @@ async def process_successful_payment(user_id, days):
     }
     
     async with ClientSession() as session:
+        # Получаем email и текущую дату
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
             profile_data = await resp.json()
             user_email = profile_data[0].get('email', 'user') if profile_data else "user"
@@ -192,11 +197,11 @@ async def process_successful_payment(user_id, days):
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
                 if resp.status not in [200, 204]:
                     logging.error(f"Ошибка Supabase: {await resp.text()}")
-        else:
-            logging.error("Не удалось создать ключи ни на одном сервере!")
+                else:
+                    logging.info(f"✅ Подписка успешно обновлена для {user_id}")
 
 # ==========================================
-# API ДЛЯ ПРИЛОЖЕНИЯ (Создание платежа через Cyberbiz)
+# API: СОЗДАНИЕ ПЛАТЕЖА CYBERBIZ
 # ==========================================
 async def handle_create_cyberbiz_payment(request):
     try:
@@ -208,16 +213,21 @@ async def handle_create_cyberbiz_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        # Уникальный ID заказа
+        # Формат order_id: user_id_days_timestamp
         order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
+        
+        # Формируем подпись (MD5 от суммы : order_id : секрета)
+        sign_str = f"{amount}:{order_id}:{CYBERBIZ_SECRET}"
+        signature = hashlib.md5(sign_str.encode()).hexdigest()
 
-        # Формируем запрос к API Cyberbiz (согласно стандартной документации)
+        # Формируем тело запроса для API Cyberbiz
         payload = {
-            "amount": int(float(amount)),  # Сумма в рублях (или копейках, зависит от настроек)
-            "currency": "RUB",
-            "orderId": order_id,
-            "description": f"EchoVPN Subscription {days} days",
-            # "method": "card" # Раскомментируй, если нужно жестко задать метод
+            "merchant_id": CYBERBIZ_SHOP_ID,
+            "amount": amount,
+            "order_id": order_id,
+            "sign": signature,
+            "description": f"VPN Subscription {days} days",
+            "currency": "RUB"
         }
 
         headers = {
@@ -225,30 +235,33 @@ async def handle_create_cyberbiz_payment(request):
             "Content-Type": "application/json"
         }
 
+        # Отправляем POST-запрос на создание платежа
         async with ClientSession() as session:
-            # ВНИМАНИЕ: Мы делаем POST запрос на API Cyberbiz
-            async with session.post("https://cyberbiz.bz/api/v1/payment", json=payload, headers=headers) as resp:
+            async with session.post("https://pay.cyberbiz.bz/api/v1/payment", json=payload, headers=headers) as resp:
+                response_text = await resp.text()
+                logging.info(f"Ответ от Cyberbiz API: статус {resp.status}, тело: {response_text}")
+
                 if resp.status == 200:
                     response_data = await resp.json()
-                    payment_url = response_data.get("paymentUrl")
-                    
+                    # Ищем URL для оплаты (может быть payment_url или url)
+                    payment_url = response_data.get('payment_url') or response_data.get('url')
                     if payment_url:
-                        logging.info(f"Успешно создана ссылка на оплату: {payment_url}")
-                        return web.Response(text=json.dumps({"payment_url": payment_url}), status=200, content_type='application/json')
+                        return web.Response(
+                            text=json.dumps({"payment_url": payment_url}),
+                            status=200,
+                            content_type='application/json'
+                        )
                     else:
-                        logging.error(f"В ответе Cyberbiz нет paymentUrl: {response_data}")
-                        return web.Response(text=json.dumps({"error": "No paymentUrl in response"}), status=500, content_type='application/json')
+                        return web.Response(text=json.dumps({"error": "No payment URL in response"}), status=500, content_type='application/json')
                 else:
-                    error_text = await resp.text()
-                    logging.error(f"Ошибка API Cyberbiz (статус {resp.status}): {error_text}")
-                    return web.Response(text=json.dumps({"error": "Cyberbiz API error"}), status=500, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": f"Cyberbiz error: {response_text}"}), status=resp.status, content_type='application/json')
 
     except Exception as e:
         logging.error(f"Ошибка создания платежа: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 # ==========================================
-# ВЕБХУК ОТ CYBERBIZ (Прием уведомлений)
+# ВЕБХУК ОТ CYBERBIZ
 # ==========================================
 async def handle_cyberbiz_webhook(request):
     try:
@@ -264,6 +277,7 @@ async def handle_cyberbiz_webhook(request):
                 user_id = parts[0]
                 days = int(parts[1])
                 
+                # Запускаем активацию в фоне
                 asyncio.create_task(process_successful_payment(user_id, days))
                 logging.info(f"✅ Оплата по заказу {order_id} успешна! Запущена активация.")
                 return web.Response(text="OK", status=200)
@@ -276,16 +290,56 @@ async def handle_cyberbiz_webhook(request):
         return web.Response(text="Error", status=500)
 
 # ==========================================
-# ЗАПУСК СЕРВЕРА
+# СТАРЫЙ API ДЛЯ СОЗДАНИЯ VPN (ОСТАВЛЯЕМ ДЛЯ СОВМЕСТИМОСТИ)
+# ==========================================
+async def handle_create_vpn(request):
+    logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN (ВРУЧНУЮ) !!!")
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return web.Response(text=json.dumps({"error": "Missing or invalid Authorization header"}), status=401, content_type='application/json')
+    
+    token = auth_header.split(' ')[1]
+
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        days = data.get('days', 30)
+
+        if not user_id:
+            return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        
+        async with ClientSession() as session:
+            sb_url = SUPABASE_URL.rstrip('/')
+            async with session.get(f"{sb_url}/auth/v1/user", headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"}) as auth_resp:
+                if auth_resp.status != 200:
+                    return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+                
+                auth_data = await auth_resp.json()
+                if auth_data.get('id') != user_id:
+                    return web.Response(text=json.dumps({"error": "User ID mismatch"}), status=403, content_type='application/json')
+
+            # Вызываем нашу функцию активации
+            await process_successful_payment(user_id, days)
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+
+    except Exception as e:
+        logging.error(f"Критическая ошибка API: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+# ==========================================
+# ЗАПУСК ВЕБ-СЕРВЕРА
 # ==========================================
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     
-    # Наши роуты
+    app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
+    app.router.add_post('/api/create-vpn', handle_create_vpn)
     app.router.add_post('/api/cyberbiz/create-payment', handle_create_cyberbiz_payment)
     app.router.add_post('/api/cyberbiz/webhook', handle_cyberbiz_webhook)
-    
+
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
