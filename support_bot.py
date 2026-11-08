@@ -28,7 +28,7 @@ SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 # --- НАСТРОЙКИ CYBERBIZ ---
 CYBERBIZ_SHOP_ID = "1794171345"
 CYBERBIZ_SECRET = "SNB1QkaHLuVPZEpjd"
-CYBERBIZ_API_TOKEN = "hrdQmAgJBgGniZoQ" 
+CYBERBIZ_API_TOKEN = "BT7m9_ue59veCFtv" 
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
