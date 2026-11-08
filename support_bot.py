@@ -11,7 +11,7 @@ from aiohttp import web
 # ==========================================
 # НАСТРОЙКИ
 # ==========================================
-BOT_TOKEN = os.getenv('BOT_TOKEN', '9011387922:AAGVT8OGVvWcY6HvGY6JlGsZfw9FPPEebf8')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.hexed.pw/d/II9QBaio8oE8jQ' 
 PRIVACY_URL = 'https://telegra.ph/Politika-konfidencialnosti-EchoVPN-11-07'
