@@ -120,7 +120,6 @@ async def process_successful_payment(user_id, days):
     }
     
     async with ClientSession() as session:
-        # Получаем email и текущую дату
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
             profile_data = await resp.json()
             user_email = profile_data[0].get('email', 'user') if profile_data else "user"
@@ -212,68 +211,47 @@ async def handle_create_cyberbiz_payment(request):
         # Формируем уникальный ID заказа
         order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
         
-        # Правильный URL API из документации Cyberbiz
-        api_url = "https://pay.cyberbiz.bz/api/v1/payment"
+        # Генерируем ссылку по образцу из виджета
+        # payment=01 означает оплату картой (обычно)
+        payment_url = (
+            f"https://cyberbiz.bz/kassa/pay?merchant={CYBERBIZ_SHOP_ID}"
+            f"&amount={amount}"
+            f"&comment=EchoVPN+Subscription"
+            f"&payment=01"
+            f"&desc={order_id}"
+            f"&url_sucess=https://echovpn.netlify.app/success"
+            f"&url_fail=https://echovpn.netlify.app/error"
+        )
         
-        headers = {
-            "Authorization": f"Bearer {CYBERBIZ_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "amount": amount,
-            "currency": "RUB",
-            "method": "card", # или "sbp" для СБП
-            "orderId": order_id
-        }
-        
-        async with ClientSession() as session:
-            async with session.post(api_url, json=payload, headers=headers) as resp:
-                resp_text = await resp.text()
-                
-                # Проверка, что вернулся JSON, а не HTML
-                if 'application/json' not in resp.content_type:
-                    logging.error(f"Ошибка API Cyberbiz (не JSON): {resp_text[:200]}...")
-                    return web.Response(text=json.dumps({"error": "Cyberbiz API returned invalid format"}), status=500, content_type='application/json')
-                    
-                resp_data = await resp.json()
-                logging.info(f"Успешный ответ от Cyberbiz API: {resp_data}")
-                
-                payment_url = resp_data.get('paymentUrl')
-                if not payment_url:
-                    return web.Response(text=json.dumps({"error": "No paymentUrl in response"}), status=500, content_type='application/json')
-                    
-                return web.Response(
-                    text=json.dumps({"payment_url": payment_url}),
-                    status=200,
-                    content_type='application/json'
-                )
+        logging.info(f"Создана ссылка на оплату: {payment_url}")
+
+        return web.Response(
+            text=json.dumps({"payment_url": payment_url}),
+            status=200,
+            content_type='application/json'
+        )
                 
     except Exception as e:
         logging.error(f"Критическая ошибка создания платежа: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 # ==========================================
-# ВЕБХУК ОТ CYBERBIZ (Прием уведомлений)
+# ВЕБХУК ОТ CYBERBIZ
 # ==========================================
 async def handle_cyberbiz_webhook(request):
     try:
         data = await request.post()
         logging.info(f"Получен вебхук от Cyberbiz: {data}")
         
-        order_id = data.get('order_id')
+        order_id = data.get('order_id') or data.get('desc')
         status = data.get('status')
         
         if status == 'success' and order_id:
-            # Расшифровываем order_id обратно (user_id_days_timestamp)
             parts = order_id.split('_')
             if len(parts) >= 2:
                 user_id = parts[0]
                 days = int(parts[1])
-                
-                # Запускаем процесс активации в фоне, чтобы не задерживать ответ
                 asyncio.create_task(process_successful_payment(user_id, days))
-                
                 logging.info(f"✅ Оплата по заказу {order_id} успешна! Запущена активация.")
                 return web.Response(text="OK", status=200)
         
@@ -284,20 +262,12 @@ async def handle_cyberbiz_webhook(request):
         logging.error(f"Ошибка обработки вебхука: {e}")
         return web.Response(text="Error", status=500)
 
-async def handle_create_vpn(request):
-    # Твой старый код создания VPN (оставлен на всякий случай, если понадобится)
-    return web.Response(text=json.dumps({"status": "Deprecated. Use payment API."}), status=200, content_type='application/json')
-
 # ==========================================
 # ЗАПУСК СЕРВЕРА
 # ==========================================
 async def start_web_server():
     app = web.Application()
-    
-    # Основные роуты
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
-    
-    # Роуты для оплаты Cyberbiz
     app.router.add_post('/api/cyberbiz/create-payment', handle_create_cyberbiz_payment)
     app.router.add_post('/api/cyberbiz/webhook', handle_cyberbiz_webhook)
 
