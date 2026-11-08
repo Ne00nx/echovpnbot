@@ -108,6 +108,10 @@ async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
 
 async def handle_create_vpn(request):
+    async def handle_create_vpn(request):
+    logging.info("!!! ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ VPN !!!") # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+    try:
+        data = await request.json()
     """Эндпоинт для безопасного создания ключей на серверах (с заменой старых)"""
     try:
         data = await request.json()
