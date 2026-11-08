@@ -26,8 +26,8 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 # --- НАСТРОЙКИ AMYPAY ---
-AMYPAY_API_KEY = "f0b08c0d83808ceb5a2d38f661b81a43" 
-AMYPAY_SECRET_WORD_2 = "0e6052d0663024aaa9c9f5d8"
+AMYPAY_API_KEY = os.getenv('AMYPAY_API_KEY', '')
+AMYPAY_SECRET_WORD_2 = os.getenv('AMYPAY_SECRET_WORD_2', '')
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
