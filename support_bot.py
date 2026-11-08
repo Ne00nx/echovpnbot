@@ -2,11 +2,13 @@ import asyncio
 import logging
 import os
 import html
+import json
+import uuid
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
-from aiohttp import web
+from aiohttp import web, ClientSession
 
 # ==========================================
 # НАСТРОЙКИ
@@ -16,6 +18,10 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.hexed.pw/d/II9QBaio8oE8jQ' 
 PRIVACY_URL = 'https://telegra.ph/Politika-konfidencialnosti-EchoVPN-11-07'
 OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
+
+# Ключи для доступа к Supabase (БУДУТ ДОБАВЛЕНЫ В RENDER)
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
@@ -95,13 +101,93 @@ async def reply_to_user(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке: {e}")
 
-# Веб-сервер для Render
+# ==========================================
+# ВЕБ-СЕРВЕР И API ДЛЯ СОЗДАНИЯ VPN
+# ==========================================
 async def handle(request):
     return web.Response(text="EchoVPN bot is running!")
+
+async def handle_create_vpn(request):
+    """Эндпоинт для безопасного создания ключей на серверах"""
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        days = data.get('days', 30)
+
+        if not user_id:
+            return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
+
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            # 1. Получаем список серверов из Supabase
+            async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
+                servers = await resp.json()
+
+            generated_urls = {}
+            client_uuid = str(uuid.uuid4())
+
+            # 2. Идем на каждый сервер и создаем клиента
+            for server in servers:
+                api_url = server['api_url']
+                api_token = server['api_token']
+                inbound_id = server['inbound_id']
+                
+                payload = {
+                    "name": f"user_{client_uuid[:8]}",
+                    "uuid": client_uuid,
+                    "days": days,
+                    "inbound_ids": [inbound_id]
+                }
+                
+                headers_xui = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_token}",
+                    "X-API-Key": api_token
+                }
+
+                try:
+                    async with session.post(api_url, json=payload, headers=headers_xui, timeout=10) as resp:
+                        if resp.status in [200, 201]:
+                            domain = server['domain']
+                            pbk = server['pbk']
+                            sid = server['sid']
+                            
+                            # Формируем ссылку и убираем пробелы
+                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
+                            vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
+                            
+                            generated_urls[server['id']] = vless_url
+                        else:
+                            err = await resp.text()
+                            logging.error(f"Ошибка на сервере {server['name']}: {err}")
+                except Exception as e:
+                    logging.error(f"Сетевая ошибка на сервере {server['name']}: {e}")
+
+            # 3. Сохраняем результат в профиль пользователя
+            update_data = {"vless_urls": generated_urls}
+            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
+            
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
+                if resp.status not in [200, 204]:
+                    err = await resp.text()
+                    logging.error(f"Ошибка Supabase: {err}")
+                    return web.Response(text=json.dumps({"error": f"Supabase error: {err}"}), status=500, content_type='application/json')
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+
+    except Exception as e:
+        logging.error(f"Критическая ошибка API: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle)
+    app.router.add_post('/api/create-vpn', handle_create_vpn) # НОВЫЙ МАРШРУТ
+    
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
