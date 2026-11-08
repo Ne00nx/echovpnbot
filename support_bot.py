@@ -34,8 +34,10 @@ dp = Dispatcher()
 dp.include_router(router)
 
 class UserState(StatesGroup):
+    waiting_for_email_buy = State()
     waiting_for_email_status = State()
 
+user_temp_data = {}
 admin_reply_map = {}
 
 async def check_amypay_token():
@@ -80,7 +82,37 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
     )
 
 @router.callback_query(F.data == "buy_menu")
-async def show_buy_menu(callback: CallbackQuery):
+async def ask_email_for_buy(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserState.waiting_for_email_buy)
+    await callback.message.edit_text(
+        "📧 <b>Введите ваш Email</b>, указанный при регистрации в приложении.\n\n"
+        "Если вы еще не зарегистрированы, введите email, который планируете использовать. "
+        "Оплата сохранится и начислится автоматически после регистрации в приложении.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]])
+    )
+
+@router.message(UserState.waiting_for_email_buy)
+async def process_email_for_buy(message: Message, state: FSMContext):
+    email = message.text.strip().lower()
+    await state.clear()
+    
+    headers_sb = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+    
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+            data = await resp.json()
+            
+    if data:
+        user_temp_data[message.from_user.id] = data[0]['id']
+    else:
+        user_temp_data[message.from_user.id] = f"waiting_{email}"
+        
+    await show_plans(message)
+
+async def show_plans(message: Message):
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
@@ -91,7 +123,7 @@ async def show_buy_menu(callback: CallbackQuery):
             plans = await resp.json()
 
     if not plans:
-        await callback.message.edit_text("❌ Тарифы временно недоступны.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
+        await message.answer("❌ Тарифы временно недоступны.", reply_markup=get_user_menu())
         return
 
     keyboard = []
@@ -102,8 +134,8 @@ async def show_buy_menu(callback: CallbackQuery):
         )])
     
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
-    await callback.message.edit_text(
-        "💳 <b>Выберите тариф для покупки:</b>\n\nПосле нажатия кнопки вы получите ссылку на оплату.",
+    await message.answer(
+        "💳 <b>Выберите тариф для покупки:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
 
@@ -113,15 +145,19 @@ async def process_payment(callback: CallbackQuery):
     days = int(days_str)
     amount = float(amount_str)
     
-    user_id = str(callback.from_user.id)
+    target_id = user_temp_data.get(callback.from_user.id)
     
+    if not target_id:
+        await callback.message.edit_text("❌ Сессия истекла. Пожалуйста, начните заново.", reply_markup=get_user_menu())
+        return
+
     api_url = "https://amypay.ru/api/v2/orders"
     headers = {
         "Authorization": f"Bearer {AMYPAY_API_KEY}",
         "Content-Type": "application/json"
     }
     
-    order_id = f"{user_id}_{days}_{int(datetime.now().timestamp())}"
+    order_id = f"{target_id}_{days}_{int(datetime.now().timestamp())}"
     
     payload = {
         "amount": int(amount),
@@ -159,7 +195,7 @@ async def ask_email_status(callback: CallbackQuery, state: FSMContext):
 
 @router.message(UserState.waiting_for_email_status)
 async def process_email_status(message: Message, state: FSMContext):
-    email = message.text.strip()
+    email = message.text.strip().lower()
     await state.clear()
     
     headers_sb = {
@@ -309,6 +345,7 @@ async def process_successful_payment(user_id, days):
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
+                logging.error(f"Профиль {user_id} не найден в базе.")
                 return
             user_email = profile_data[0].get('email', 'user')
             current_expires_str = profile_data[0].get('subscription_expires_at')
@@ -430,9 +467,26 @@ async def handle_amypay_webhook(request):
         if external_order_id:
             parts = external_order_id.split('_')
             if len(parts) >= 2:
-                user_id = parts[0]
+                target_id = parts[0]
                 days = int(parts[1])
-                asyncio.create_task(process_successful_payment(user_id, days))
+                
+                if target_id.startswith("waiting_"):
+                    email = target_id.replace("waiting_", "")
+                    logging.info(f"Отложенная оплата для {email} на {days} дней. Сохраняем в БД.")
+                    
+                    headers_sb = {
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal"
+                    }
+                    
+                    async with ClientSession() as session:
+                        payload = {"email": email, "days": days}
+                        await session.post(f"{SUPABASE_URL}/rest/v1/pending_payments", json=payload, headers=headers_sb)
+                else:
+                    asyncio.create_task(process_successful_payment(target_id, days))
+                    
                 return web.Response(text="OK", status=200)
         
         return web.Response(text="OK", status=200)
@@ -441,11 +495,46 @@ async def handle_amypay_webhook(request):
         logging.error(f"Ошибка обработки вебхука: {e}")
         return web.Response(text="Error", status=500)
 
+async def handle_check_pending(request):
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        email = data.get('email')
+        
+        if not user_id or not email:
+            return web.Response(text="Bad Request", status=400)
+            
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/pending_payments?email=eq.{email}&select=id,days", headers=headers_sb) as resp:
+                pending = await resp.json()
+                
+            if not pending:
+                return web.Response(text="No pending payments", status=404)
+                
+            for p in pending:
+                days = p['days']
+                await process_successful_payment(user_id, days)
+                
+                async with session.delete(f"{SUPABASE_URL}/rest/v1/pending_payments?id=eq.{p['id']}", headers=headers_sb) as del_resp:
+                    pass
+                    
+            return web.Response(text="OK", status=200)
+            
+    except Exception as e:
+        logging.error(f"Ошибка проверки отложенных платежей: {e}")
+        return web.Response(text="Error", status=500)
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     app.router.add_post('/api/amypay/create-payment', handle_create_amypay_payment)
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
+    app.router.add_post('/api/check-pending', handle_check_pending)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
