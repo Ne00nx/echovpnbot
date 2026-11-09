@@ -240,7 +240,6 @@ async def process_email_status(message: Message, state: FSMContext):
     expires_at_str = profile.get('subscription_expires_at')
     plan = profile.get('subscription_plan')
     
-    # Если это семейный аккаунт, проверяем срок владельца
     if profile.get('family_owner_id'):
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{profile['family_owner_id']}&select=subscription_expires_at", headers=headers_sb) as resp:
@@ -448,10 +447,8 @@ async def process_successful_payment(user_id, days):
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
-            # ОБРАБОТКА РЕФЕРАЛЬНОГО БОНУСА
             if referred_by:
                 logging.info(f"Пользователь {user_id} был приглашен {referred_by}. Начисляем бонус пригласившему.")
-                # Начисляем 7 дней пригласившему
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}&select=subscription_expires_at", headers=headers_sb) as ref_resp:
                     ref_data = await ref_resp.json()
                     if ref_data:
@@ -467,7 +464,6 @@ async def process_successful_payment(user_id, days):
                                                  headers=headers_sb) as _:
                             pass
                 
-                # Убираем привязку, чтобы бонус не начислялся дважды за одного пользователя
                 update_data["referred_by"] = None
 
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
@@ -676,13 +672,11 @@ async def handle_apply_referral(request):
         }
         
         async with ClientSession() as session:
-            # 1. Проверяем, не использовал ли уже этот пользователь реферальный код
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=referred_by", headers=headers_sb) as resp:
                 user_data = await resp.json()
                 if user_data and user_data[0].get('referred_by'):
                     return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400, content_type='application/json')
                     
-            # 2. Ищем владельца кода
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{referral_code}&select=id", headers=headers_sb) as resp:
                 referrer_data = await resp.json()
                 if not referrer_data:
@@ -693,9 +687,50 @@ async def handle_apply_referral(request):
                 if referrer_id == user_id:
                     return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400, content_type='application/json')
 
-            # 3. Привязываем пользователя к рефереру
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
                                      json={"referred_by": referrer_id}, 
+                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+                pass
+                
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_join_family(request):
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        family_code = data.get('familyCode')
+        
+        if not user_id or not family_code:
+            return web.Response(text="Bad Request", status=400)
+            
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            # Проверяем, не привязан ли уже к семье
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=family_owner_id", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if user_data and user_data[0].get('family_owner_id'):
+                    return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
+                    
+            # Ищем владельца по коду
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{family_code}&select=id", headers=headers_sb) as resp:
+                owner_data = await resp.json()
+                if not owner_data:
+                    return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404, content_type='application/json')
+                
+                owner_id = owner_data[0]['id']
+                
+                if owner_id == user_id:
+                    return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400, content_type='application/json')
+
+            # Привязываем пользователя к семье
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                     json={"family_owner_id": owner_id}, 
                                      headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
                 
@@ -711,6 +746,7 @@ async def start_web_server():
     app.router.add_post('/api/check-pending', handle_check_pending)
     app.router.add_post('/api/trial', handle_trial)
     app.router.add_post('/api/apply-referral', handle_apply_referral)
+    app.router.add_post('/api/join-family', handle_join_family)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
