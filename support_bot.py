@@ -96,7 +96,6 @@ async def ask_email_for_buy(callback: CallbackQuery, state: FSMContext):
 async def process_email_for_buy(message: Message, state: FSMContext):
     email = message.text.strip().lower()
     
-    # Сохраняем email во временные данные и переходим к подтверждению
     user_temp_data[message.from_user.id] = {"email": email}
     await state.set_state(UserState.confirming_email_buy)
     
@@ -187,7 +186,6 @@ async def process_payment(callback: CallbackQuery):
         "Content-Type": "application/json"
     }
     
-    # Добавляем chat_id в order_id для отправки уведомления после оплаты!
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}"
     
     payload = {
@@ -458,7 +456,7 @@ async def handle_create_amypay_payment(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}"
+        order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}|0"
         
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {
@@ -500,7 +498,7 @@ async def handle_amypay_webhook(request):
             if len(parts) >= 2:
                 target_id = parts[0]
                 days = int(parts[1])
-                chat_id = int(parts[3]) if len(parts) > 3 else None # Получаем chat_id
+                chat_id = int(parts[3]) if len(parts) > 3 and parts[3] != '0' else None
                 
                 if target_id.startswith("waiting_"):
                     email = target_id.replace("waiting_", "")
@@ -575,12 +573,47 @@ async def handle_check_pending(request):
         logging.error(f"Ошибка проверки отложенных платежей: {e}")
         return web.Response(text="Error", status=500)
 
+async def handle_trial(request):
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+
+        if not user_id:
+            return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
+
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=has_used_trial", headers=headers_sb) as resp:
+                profile = await resp.json()
+                
+                if not profile:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                    
+                if profile[0].get('has_used_trial'):
+                    return web.Response(text=json.dumps({"error": "Trial already used"}), status=403, content_type='application/json')
+
+            await process_successful_payment(user_id, 7)
+            
+            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"has_used_trial": True}, headers=headers_patch) as resp:
+                pass
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Ошибка активации триала: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     app.router.add_post('/api/amypay/create-payment', handle_create_amypay_payment)
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
     app.router.add_post('/api/check-pending', handle_check_pending)
+    app.router.add_post('/api/trial', handle_trial)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
