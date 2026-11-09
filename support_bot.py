@@ -16,6 +16,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web, ClientSession
 
+# --- FIREBASE IMPORTS ---
+import firebase_admin
+from firebase_admin import credentials, messaging
+# ------------------------
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ' 
@@ -33,6 +38,15 @@ router = Router()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
+
+# --- ИНИЦИАЛИЗАЦИЯ FIREBASE ---
+try:
+    cred = credentials.Certificate('/etc/secrets/firebase-service-account.json')
+    firebase_admin.initialize_app(cred)
+    logging.info("Firebase Admin успешно инициализирован.")
+except Exception as e:
+    logging.warning(f"Не удалось инициализировать Firebase Admin: {e}. Пуши работать не будут.")
+# ------------------------------
 
 class UserState(StatesGroup):
     waiting_for_email_buy = State()
@@ -92,6 +106,20 @@ async def check_amypay_token():
                     logging.error(f"Amypay API ключ НЕВАЛИДЕН! Статус: {resp.status}")
     except Exception as e:
         logging.error(f"Ошибка проверки ключа Amypay: {e}")
+
+# --- ФУНКЦИЯ ОТПРАВКИ ПУШЕЙ ---
+def send_push_notification(fcm_token, title, body):
+    if not fcm_token: return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=fcm_token,
+        )
+        messaging.send(message)
+        logging.info(f"Пуш успешно отправлен на токен {fcm_token[:10]}...")
+    except Exception as e:
+        logging.error(f"Ошибка отправки пуша: {e}")
+# ------------------------------
 
 def get_user_menu():
     keyboard = [
@@ -495,7 +523,7 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
     }
     
     async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code", headers=headers_sb) as resp:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code,fcm_token", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
                 logging.error(f"Профиль {user_id} не найден.")
@@ -506,6 +534,7 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
             referred_by = profile_data[0].get('referred_by')
             bonus_paid = profile_data[0].get('referral_bonus_paid', False)
             current_family_code = profile_data[0].get('family_code')
+            user_fcm_token = profile_data[0].get('fcm_token')
         
         client_name = f"u_{user_id[:8]}"
 
@@ -589,6 +618,14 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                     logging.error(f"Ошибка Supabase: {await resp.text()}")
                 else:
                     logging.info(f"Подписка для {user_id} обновлена.")
+
+            # Отправляем пуш об успешной активации, если это не бонус
+            if not is_bonus and user_fcm_token:
+                send_push_notification(
+                    user_fcm_token, 
+                    "✅ Подписка активирована!", 
+                    f"Ваш VPN готов к использованию. Приятного серфинга!"
+                )
 
             if is_family_plan or current_family_code:
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as resp:
@@ -747,13 +784,17 @@ async def process_webhook_background(target_id, days, chat_id, is_family, action
             if action_type == "device":
                 headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
                 async with ClientSession() as session:
-                    async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}&select=max_devices_allowed", headers=headers_sb) as resp:
+                    async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}&select=max_devices_allowed,fcm_token", headers=headers_sb) as resp:
                         p = await resp.json()
                         current_max = p[0].get('max_devices_allowed', 2) if p else 2
+                        user_fcm_token = p[0].get('fcm_token') if p else None
                     
                     new_max = min(current_max + 1, 5)
                     await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}", 
                                         json={"max_devices_allowed": new_max}, headers={**headers_sb, "Content-Type": "application/json"})
+                
+                if user_fcm_token:
+                    send_push_notification(user_fcm_token, "✅ Слот добавлен!", "Теперь вы можете войти еще на одном устройстве.")
                 
                 if chat_id:
                     await bot.send_message(chat_id=chat_id, text="✅ <b>Слот устройства добавлен!</b>\n\nТеперь вы можете войти еще на одном устройстве.")
@@ -1063,6 +1104,35 @@ async def handle_leave_family(request):
     except Exception as e:
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
+async def handle_cron_expiring(request):
+    try:
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        
+        async with ClientSession() as session:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?fcm_token=not.is.null&subscription_expires_at=not.is.null&select=email,fcm_token,subscription_expires_at", 
+                headers=headers_sb
+            ) as resp:
+                profiles = await resp.json()
+                
+        now = datetime.now(timezone.utc)
+        count = 0
+        
+        for profile in profiles:
+            expires_at = datetime.fromisoformat(profile['subscription_expires_at'].replace('Z', '+00:00'))
+            days_left = (expires_at - now).days
+            
+            if days_left in [3, 1]:
+                title = "⚠️ Подписка истекает!"
+                body = f"У вас осталось {days_left} дн. Продлите сейчас, чтобы не остаться без VPN."
+                send_push_notification(profile['fcm_token'], title, body)
+                count += 1
+                
+        return web.Response(text=f"Cron executed. Pushes sent: {count}", status=200)
+    except Exception as e:
+        logging.error(f"Ошибка крона пушей: {e}")
+        return web.Response(text=str(e), status=500)
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
@@ -1076,6 +1146,7 @@ async def start_web_server():
     app.router.add_post('/api/leave-family', handle_leave_family)
     app.router.add_post('/api/check-device', handle_check_device)
     app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
+    app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring) # <--- НОВЫЙ РОУТ
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
