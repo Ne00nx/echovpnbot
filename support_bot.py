@@ -41,9 +41,7 @@ class UserState(StatesGroup):
 user_temp_data = {}
 admin_reply_map = {}
 
-
 async def get_user_id_from_token(request):
-    """Проверяет JWT токен Supabase и возвращает реальный user_id"""
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return None
@@ -65,7 +63,6 @@ async def get_user_id_from_token(request):
     return None
 
 async def get_plan_from_db(plan_id):
-    """Берет тариф из БД, чтобы хакер не подменил цену"""
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
@@ -79,7 +76,6 @@ async def get_plan_from_db(plan_id):
     except Exception as e:
         logging.error(f"Ошибка получения тарифа: {e}")
     return None
-
 
 async def check_amypay_token():
     if not AMYPAY_API_KEY: return
@@ -192,7 +188,6 @@ async def show_plans(message: Message):
 
     keyboard = []
     for plan in plans:
-        # Теперь передаем plan_id вместо дней и суммы
         keyboard.append([InlineKeyboardButton(
             text=f"{plan['name']} — {plan['price_rub']} ₽", 
             callback_data=f"pay_{plan['id']}"
@@ -228,7 +223,8 @@ async def process_payment(callback: CallbackQuery):
         "Content-Type": "application/json"
     }
     
-    order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}"
+    # Формат order_id: user_id|days|timestamp|chat_id|is_family|action_type
+    order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}|sub"
     
     payload = {
         "amount": int(amount),
@@ -353,6 +349,31 @@ async def cmd_give_days(message: Message):
     await process_successful_payment(user_id, days)
     await message.answer(f"✅ Подписка на {days} дней успешно выдана для {email}!")
 
+@router.message(Command("reset_device"), F.from_user.id == ADMIN_ID)
+async def cmd_reset_device(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("⚠️ Использование: <code>/reset_device email@example.com</code>")
+        return
+
+    email = args[1].strip().lower()
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+            data = await resp.json()
+            if not data:
+                await message.answer("❌ Пользователь не найден.")
+                return
+            user_id = data[0]['id']
+
+        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                 json={"active_devices": []}, 
+                                 headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+            pass
+
+    await message.answer(f"✅ Все устройства для {email} успешно отвязаны.")
+
 @router.message(F.chat.id != ADMIN_ID)
 async def forward_to_admin(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -412,7 +433,6 @@ async def reply_to_user(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
-
 async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
     logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan})")
     
@@ -434,7 +454,6 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
             bonus_paid = profile_data[0].get('referral_bonus_paid', False)
             current_family_code = profile_data[0].get('family_code')
         
-        # ФИКС: Уникальное имя клиента, чтобы не было коллизий
         client_name = f"u_{user_id[:8]}"
 
         now = datetime.now(timezone.utc)
@@ -518,7 +537,6 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                 else:
                     logging.info(f"Подписка для {user_id} обновлена.")
 
-            # ФИКС: Если это владелец семьи, обновляем сроки всем участникам
             if is_family_plan or current_family_code:
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as resp:
                     members = await resp.json()
@@ -527,21 +545,19 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                         await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member['id']}", json=m_update, headers=headers_patch)
                         logging.info(f"Обновлена подписка члена семьи {member['id']}")
 
-
 async def handle_create_amypay_payment(request):
     try:
-        # 1. Проверка JWT
         real_user_id = await get_user_id_from_token(request)
         if not real_user_id:
             return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
 
         data = await request.json()
-        plan_id = data.get('planId') # Ждем planId, а не days/amount
+        plan_id = data.get('planId') 
+        promo_code = data.get('promoCode')
 
         if not plan_id:
             return web.Response(text=json.dumps({"error": "No planId"}), status=400, content_type='application/json')
 
-        # 2. Берем цену и дни только из БД
         plan = await get_plan_from_db(plan_id)
         if not plan:
             return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400, content_type='application/json')
@@ -550,7 +566,17 @@ async def handle_create_amypay_payment(request):
         amount = plan['price_rub']
         is_family = 'Семейная' in plan['name']
 
-        order_id = f"{real_user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}"
+        # Промокоды (если добавишь таблицу promocodes)
+        if promo_code:
+            headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+            async with ClientSession() as session:
+                async with session.get(f"{SUPABASE_URL}/rest/v1/promocodes?code=eq.{promo_code}&is_active=eq.true", headers=headers_sb) as resp:
+                    promo_data = await resp.json()
+                    if promo_data:
+                        discount = promo_data[0]['discount_percent']
+                        amount = amount - (amount * discount / 100)
+
+        order_id = f"{real_user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}|sub"
         
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {
@@ -583,9 +609,32 @@ async def handle_create_amypay_payment(request):
         logging.error(f"Error create payment: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
+async def handle_buy_device_slot(request):
+    try:
+        real_user_id = await get_user_id_from_token(request)
+        if not real_user_id:
+            return web.Response(status=401)
+            
+        amount = 99 
+        order_id = f"{real_user_id}|0|{int(datetime.now().timestamp())}|0|false|device" 
+        
+        api_url = "https://amypay.ru/api/v2/orders"
+        headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
+        payload = {"amount": amount, "external_order_id": order_id, "description": "EchoVPN Extra Device Slot"}
+        
+        async with ClientSession() as session:
+            async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
+                resp_data = await resp.json()
+                if resp.status in [200, 201] and resp_data.get('ok'):
+                    pay_url = resp_data.get('order', {}).get('pay_url')
+                    if pay_url:
+                        return web.Response(text=json.dumps({"payment_url": pay_url}), status=200, content_type='application/json')
+        return web.Response(text="Error", status=500)
+    except Exception as e:
+        return web.Response(text=str(e), status=500)
+
 async def handle_amypay_webhook(request):
     try:
-
         data = await request.post()
         external_order_id = data.get('external_order_id')
         
@@ -596,9 +645,9 @@ async def handle_amypay_webhook(request):
                 days = int(parts[1])
                 chat_id = int(parts[3]) if len(parts) > 3 and parts[3] != '0' else None
                 is_family = parts[4].lower() == 'true' if len(parts) > 4 else False
+                action_type = parts[5] if len(parts) > 5 else "sub"
                 
-                # ФИКС: Отвечаем Amypay моментально, обработку делаем в фоне
-                asyncio.create_task(process_webhook_background(target_id, days, chat_id, is_family))
+                asyncio.create_task(process_webhook_background(target_id, days, chat_id, is_family, action_type))
                     
                 return web.Response(text="OK", status=200)
         
@@ -608,8 +657,7 @@ async def handle_amypay_webhook(request):
         logging.error(f"Ошибка обработки вебхука: {e}")
         return web.Response(text="Error", status=500)
 
-async def process_webhook_background(target_id, days, chat_id, is_family):
-    """Фоновая обработка вебхука, чтобы не было таймаутов"""
+async def process_webhook_background(target_id, days, chat_id, is_family, action_type="sub"):
     try:
         if target_id.startswith("waiting_"):
             email = target_id.replace("waiting_", "")
@@ -633,14 +681,28 @@ async def process_webhook_background(target_id, days, chat_id, is_family):
                          "Мы сохранили вашу подписку. Она начислится автоматически, как только вы зарегистрируетесь в приложении с этим email."
                 )
         else:
-            await process_successful_payment(target_id, days, is_family_plan=is_family)
-            
-            if chat_id:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="✅ <b>Оплата успешно получена!</b>\n\n"
-                         "Ваша подписка активирована. Откройте приложение EchoVPN, обновите экран подписки, и вы увидите новые дни."
-                )
+            if action_type == "device":
+                headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+                async with ClientSession() as session:
+                    async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}&select=max_devices_allowed", headers=headers_sb) as resp:
+                        p = await resp.json()
+                        current_max = p[0].get('max_devices_allowed', 2) if p else 2
+                    
+                    new_max = min(current_max + 1, 5)
+                    await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}", 
+                                        json={"max_devices_allowed": new_max}, headers={**headers_sb, "Content-Type": "application/json"})
+                
+                if chat_id:
+                    await bot.send_message(chat_id=chat_id, text="✅ <b>Слот устройства добавлен!</b>\n\nТеперь вы можете войти еще на одном устройстве.")
+            else:
+                await process_successful_payment(target_id, days, is_family_plan=is_family)
+                
+                if chat_id:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ <b>Оплата успешно получена!</b>\n\n"
+                             "Ваша подписка активирована. Откройте приложение EchoVPN, обновите экран подписки, и вы увидите новые дни."
+                    )
     except Exception as e:
         logging.error(f"Ошибка фоновой обработки вебхука: {e}")
 
@@ -669,7 +731,6 @@ async def handle_check_pending(request):
                 return web.Response(text="No pending payments", status=404)
                 
             for p in pending:
-                # Сначала удаляем, чтобы избежать двойного начисления при race condition
                 async with session.delete(f"{SUPABASE_URL}/rest/v1/pending_payments?id=eq.{p['id']}", headers=headers_sb) as del_resp:
                     if del_resp.status == 204:
                         await process_successful_payment(real_user_id, p['days'])
@@ -679,6 +740,49 @@ async def handle_check_pending(request):
     except Exception as e:
         logging.error(f"Ошибка проверки отложенных платежей: {e}")
         return web.Response(text="Error", status=500)
+
+async def handle_check_device(request):
+    try:
+        real_user_id = await get_user_id_from_token(request)
+        if not real_user_id:
+            return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+            
+        data = await request.json()
+        device_id = data.get('deviceId')
+        device_name = data.get('deviceName', 'Устройство') 
+        
+        if not device_id:
+            return web.Response(text=json.dumps({"error": "No deviceId"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=active_devices,max_devices_allowed", headers=headers_sb) as resp:
+                profile = await resp.json()
+                
+            if not profile: 
+                return web.Response(text=json.dumps({"error": "Profile not found"}), status=404, content_type='application/json')
+            
+            active_devices = profile[0].get('active_devices') or []
+            max_allowed = profile[0].get('max_devices_allowed') or 2
+            
+            device_exists = any(d.get('id') == device_id for d in active_devices)
+            
+            if not device_exists:
+                if len(active_devices) >= max_allowed:
+                    return web.Response(text=json.dumps({"error": "Device limit reached"}), status=403, content_type='application/json')
+                
+                active_devices.append({"id": device_id, "name": device_name})
+                
+                async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
+                                    json={"active_devices": active_devices}, 
+                                    headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as patch_resp:
+                    pass
+                
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Error check device: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_trial(request):
     try:
@@ -907,6 +1011,8 @@ async def start_web_server():
     app.router.add_post('/api/join-family', handle_join_family)
     app.router.add_post('/api/remove-family-member', handle_remove_family_member)
     app.router.add_post('/api/leave-family', handle_leave_family)
+    app.router.add_post('/api/check-device', handle_check_device)
+    app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
