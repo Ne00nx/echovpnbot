@@ -366,8 +366,8 @@ async def reply_to_user(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
-async def process_successful_payment(user_id, days):
-    logging.info(f"Активация подписки для {user_id} на {days} дней")
+async def process_successful_payment(user_id, days, is_bonus=False):
+    logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus})")
     
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -448,33 +448,15 @@ async def process_successful_payment(user_id, days):
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
-            if referred_by and not bonus_paid:
-                logging.info(f"Пользователь {user_id} был приглашен {referred_by}. Начисляем бонус пригласившему.")
-                async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}&select=subscription_expires_at", headers=headers_sb) as ref_resp:
-                    ref_data = await ref_resp.json()
-                    if ref_data:
-                        ref_expires_str = ref_data[0].get('subscription_expires_at')
-                        ref_base_date = now
-                        if ref_expires_str:
-                            ref_expires = datetime.fromisoformat(ref_expires_str.replace('Z', '+00:00'))
-                            if ref_expires > now: ref_base_date = ref_expires
-                        
-                        ref_new_expires = ref_base_date + timedelta(days=7)
-                        
-                        # ИСПРАВЛЕНО: Добавляем subscription_plan = premium пригласившему
-                        headers_patch_bonus = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
-                        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}", 
-                                                 json={
-                                                     "subscription_expires_at": ref_new_expires.isoformat(),
-                                                     "subscription_plan": "premium"
-                                                 }, 
-                                                 headers=headers_patch_bonus) as r:
-                            if r.status in [200, 204]:
-                                logging.info(f"Бонус успешно начислен пользователю {referred_by}")
-                            else:
-                                logging.error(f"Ошибка начисления бонуса: {await r.text()}")
+            # Если это не бонусное начисление, и пользователя кто-то пригласил, и бонус еще не выплачен
+            if not is_bonus and referred_by and not bonus_paid:
+                logging.info(f"Пользователь {user_id} оплатил подписку. Начисляем бонус пригласившему {referred_by}.")
                 
+                # Ставим флаг, что за ЭТОГО пользователя бонус уже выплачен
                 update_data["referral_bonus_paid"] = True
+                
+                # Запускаем начисление бонуса пригласившему (создаст ключи и дни)
+                asyncio.create_task(process_successful_payment(referred_by, 7, is_bonus=True))
 
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
