@@ -661,7 +661,8 @@ async def handle_apply_referral(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
-        referral_code = data.get('referralCode')
+        # ИСПРАВЛЕНО: Приводим код к нижнему регистру
+        referral_code = data.get('referralCode', '').strip().lower()
         
         if not user_id or not referral_code:
             return web.Response(text="Bad Request", status=400)
@@ -700,7 +701,8 @@ async def handle_join_family(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
-        family_code = data.get('familyCode')
+        # ИСПРАВЛЕНО: Приводим код к нижнему регистру
+        family_code = data.get('familyCode', '').strip().lower()
         
         if not user_id or not family_code:
             return web.Response(text="Bad Request", status=400)
