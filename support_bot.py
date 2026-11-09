@@ -5,7 +5,7 @@ import html
 import json
 import uuid
 import hashlib
-import time # ДОБАВЛЕНО для анти-спама
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
@@ -40,8 +40,8 @@ class UserState(StatesGroup):
     waiting_for_email_status = State()
 
 user_temp_data = {}
-admin_reply_map = {} # Хранит связь: ID сообщения в чате админа -> ID пользователя
-user_last_message_time = {} # ДОБАВЛЕНО: Хранит время последнего сообщения пользователя для анти-спама
+admin_reply_map = {}
+user_last_message_time = {}
 
 async def get_user_id_from_token(request):
     auth_header = request.headers.get('Authorization')
@@ -375,7 +375,6 @@ async def cmd_reset_device(message: Message):
 
     await message.answer(f"✅ Все устройства для {email} успешно отвязаны.")
 
-# --- ЛОГИКА ПОДДЕРЖКИ (С АНТИ-СПАМОМ) ---
 @router.message(F.chat.id != ADMIN_ID)
 async def forward_to_admin(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -384,14 +383,12 @@ async def forward_to_admin(message: Message, state: FSMContext):
 
     user = message.from_user
     
-    # АНТИ-СПАМ (защита от флуда)
     now = time.time()
     last_time = user_last_message_time.get(user.id, 0)
-    if now - last_time < 30: # 30 секунд
+    if now - last_time < 30:
         await message.answer("⚠️ Пожалуйста, не спамьте. Мы уже получили ваше сообщение и скоро ответим.")
         return
     user_last_message_time[user.id] = now
-    # ------------------------
 
     safe_name = html.escape(user.full_name)
     
@@ -402,7 +399,6 @@ async def forward_to_admin(message: Message, state: FSMContext):
         f"🔗 Username: @{user.username or 'нет'}\n\n"
     )
     
-    # Кнопка закрытия обращения для админа
     close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Закрыть обращение", callback_data=f"close_admin_{user.id}")]
     ])
@@ -440,7 +436,6 @@ async def reply_to_user(message: Message):
         await message.answer("❌ Не могу определить, кому отправить этот ответ (возможно, обращение уже закрыто).")
         return
 
-    # Кнопка закрытия для пользователя
     user_close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Обращение закрыто", callback_data=f"close_user_{target_user_id}")]
     ])
@@ -463,7 +458,6 @@ async def reply_to_user(message: Message):
 async def close_ticket_admin(callback: CallbackQuery):
     target_user_id = int(callback.data.split("_")[2])
     
-    # Удаляем из мапы, чтобы нельзя было ответить
     for msg_id, u_id in list(admin_reply_map.items()):
         if u_id == target_user_id:
             del admin_reply_map[msg_id]
@@ -491,10 +485,6 @@ async def close_ticket_user(callback: CallbackQuery):
         )
     except Exception:
         pass
-
-# ==========================================
-# ЛОГИКА ПОДПИСОК, ПЛАТЕЖЕЙ И API
-# ==========================================
 
 async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
     logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan})")
@@ -614,9 +604,20 @@ async def handle_create_amypay_payment(request):
         if not real_user_id:
             return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
 
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=family_owner_id", headers=headers_sb) as resp:
+                user_profile = await resp.json()
+                if user_profile and user_profile[0].get('family_owner_id'):
+                    return web.Response(
+                        text=json.dumps({"error": "Вы состоите в семейной подписке. Выйдите из семьи, чтобы купить личную."}), 
+                        status=403, 
+                        content_type='application/json'
+                    )
+
         data = await request.json()
         plan_id = data.get('planId') 
-        promo_code = data.get('promoCode', '').strip().upper() # Забираем промокод
+        promo_code = data.get('promoCode', '').strip().upper()
 
         if not plan_id:
             return web.Response(text=json.dumps({"error": "No planId"}), status=400, content_type='application/json')
@@ -626,12 +627,10 @@ async def handle_create_amypay_payment(request):
             return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400, content_type='application/json')
 
         days = plan['duration_days']
-        amount = float(plan['price_rub']) # Исходная цена
+        amount = float(plan['price_rub'])
         is_family = 'Семейная' in plan['name']
 
-        # ЛОГИКА ПРОМОКОДА
         if promo_code:
-            headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
             async with ClientSession() as session:
                 async with session.get(f"{SUPABASE_URL}/rest/v1/promocodes?code=eq.{promo_code}&is_active=eq.true", headers=headers_sb) as resp:
                     promo_data = await resp.json()
@@ -649,7 +648,7 @@ async def handle_create_amypay_payment(request):
         }
         
         payload = {
-            "amount": int(amount), # Amypay принимает целые числа
+            "amount": int(amount),
             "external_order_id": order_id,
             "description": f"EchoVPN Subscription ({days} days)"
         }
