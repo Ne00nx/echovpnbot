@@ -366,8 +366,8 @@ async def reply_to_user(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
-async def process_successful_payment(user_id, days, is_bonus=False):
-    logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus})")
+async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
+    logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan}, owner_expires={family_owner_expires})")
     
     headers_sb = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -375,7 +375,7 @@ async def process_successful_payment(user_id, days, is_bonus=False):
     }
     
     async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid", headers=headers_sb) as resp:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
                 logging.error(f"Профиль {user_id} не найден в базе.")
@@ -384,18 +384,25 @@ async def process_successful_payment(user_id, days, is_bonus=False):
             current_expires_str = profile_data[0].get('subscription_expires_at')
             referred_by = profile_data[0].get('referred_by')
             bonus_paid = profile_data[0].get('referral_bonus_paid', False)
+            current_family_code = profile_data[0].get('family_code')
         
         safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
         client_name = safe_email
 
         now = datetime.now(timezone.utc)
-        if current_expires_str:
-            current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
-            base_date = current_expires if current_expires > now else now
-        else:
-            base_date = now
         
-        new_expires = base_date + timedelta(days=days)
+        if family_owner_expires:
+            # Если это участник семьи, его срок = сроку владельца
+            new_expires = family_owner_expires
+        else:
+            # Обычная логика начисления дней
+            if current_expires_str:
+                current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
+                base_date = current_expires if current_expires > now else now
+            else:
+                base_date = now
+            new_expires = base_date + timedelta(days=days)
+        
         new_expires_iso = new_expires.isoformat()
         total_days_for_panel = max(1, (new_expires - now).days)
 
@@ -448,14 +455,16 @@ async def process_successful_payment(user_id, days, is_bonus=False):
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
-            # Если это не бонусное начисление, и пользователя кто-то пригласил, и бонус еще не выплачен
+            # Генерация семейного кода при покупке семейного тарифа
+            if is_family_plan and not current_family_code:
+                new_family_code = hashlib.md5(f"{user_id}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
+                update_data["family_code"] = new_family_code
+                logging.info(f"Сгенерирован семейный код {new_family_code} для {user_id}")
+
+            # Логика реферального бонуса
             if not is_bonus and referred_by and not bonus_paid:
                 logging.info(f"Пользователь {user_id} оплатил подписку. Начисляем бонус пригласившему {referred_by}.")
-                
-                # Ставим флаг, что за ЭТОГО пользователя бонус уже выплачен
                 update_data["referral_bonus_paid"] = True
-                
-                # Запускаем начисление бонуса пригласившему (создаст ключи и дни)
                 asyncio.create_task(process_successful_payment(referred_by, 7, is_bonus=True))
 
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
@@ -469,11 +478,13 @@ async def handle_create_amypay_payment(request):
         user_id = data.get('userId')
         days = data.get('days', 30)
         amount = float(data.get('amount', 249.00))
+        is_family = data.get('isFamily', False)
+        logging.info(f"Создание платежа: userId={user_id}, days={days}, amount={amount}, isFamily={is_family}")
 
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
 
-        order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}|0"
+        order_id = f"{user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}"
         
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {
@@ -516,6 +527,7 @@ async def handle_amypay_webhook(request):
                 target_id = parts[0]
                 days = int(parts[1])
                 chat_id = int(parts[3]) if len(parts) > 3 and parts[3] != '0' else None
+                is_family = parts[4].lower() == 'true' if len(parts) > 4 else False
                 
                 if target_id.startswith("waiting_"):
                     email = target_id.replace("waiting_", "")
@@ -539,7 +551,7 @@ async def handle_amypay_webhook(request):
                                  "Мы сохранили вашу подписку. Она начислится автоматически, как только вы зарегистрируетесь в приложении с этим email."
                         )
                 else:
-                    asyncio.create_task(process_successful_payment(target_id, days))
+                    asyncio.create_task(process_successful_payment(target_id, days, is_family_plan=is_family))
                     
                     if chat_id:
                         await bot.send_message(
@@ -703,25 +715,49 @@ async def handle_join_family(request):
         }
         
         async with ClientSession() as session:
+            # 1. Проверяем, не в семье ли уже
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=family_owner_id", headers=headers_sb) as resp:
                 user_data = await resp.json()
                 if user_data and user_data[0].get('family_owner_id'):
                     return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
                     
-            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{family_code}&select=id", headers=headers_sb) as resp:
+            # 2. Ищем владельца по family_code
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_code=eq.{family_code}&select=id,subscription_expires_at", headers=headers_sb) as resp:
                 owner_data = await resp.json()
                 if not owner_data:
                     return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404, content_type='application/json')
                 
                 owner_id = owner_data[0]['id']
+                owner_expires_str = owner_data[0].get('subscription_expires_at')
                 
                 if owner_id == user_id:
                     return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400, content_type='application/json')
 
+                if not owner_expires_str:
+                     return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400, content_type='application/json')
+
+            # 3. ПРОВЕРКА ЛИМИТА: Считаем, сколько человек уже в семье
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{owner_id}&select=id", headers=headers_sb) as resp:
+                members = await resp.json()
+                if len(members) >= 2: # Владелец + 2 участника = 3 аккаунта
+                    return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400, content_type='application/json')
+
+                # 4. Считаем дни владельца
+                now = datetime.now(timezone.utc)
+                owner_expires = datetime.fromisoformat(owner_expires_str.replace('Z', '+00:00'))
+                days_left = (owner_expires - now).days
+                
+                if days_left <= 0:
+                    return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400, content_type='application/json')
+
+            # 5. Привязываем к семье
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
                                      json={"family_owner_id": owner_id}, 
                                      headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
+            
+            # 6. Выдаем ключи новому участнику на срок владельца
+            await process_successful_payment(user_id, days_left, is_bonus=True, family_owner_expires=owner_expires)
                 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
