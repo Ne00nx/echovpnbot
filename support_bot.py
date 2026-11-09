@@ -5,6 +5,7 @@ import html
 import json
 import uuid
 import hashlib
+import time # ДОБАВЛЕНО для анти-спама
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
@@ -39,7 +40,8 @@ class UserState(StatesGroup):
     waiting_for_email_status = State()
 
 user_temp_data = {}
-admin_reply_map = {}
+admin_reply_map = {} # Хранит связь: ID сообщения в чате админа -> ID пользователя
+user_last_message_time = {} # ДОБАВЛЕНО: Хранит время последнего сообщения пользователя для анти-спама
 
 async def get_user_id_from_token(request):
     auth_header = request.headers.get('Authorization')
@@ -223,7 +225,6 @@ async def process_payment(callback: CallbackQuery):
         "Content-Type": "application/json"
     }
     
-    # Формат order_id: user_id|days|timestamp|chat_id|is_family|action_type
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}|sub"
     
     payload = {
@@ -374,6 +375,7 @@ async def cmd_reset_device(message: Message):
 
     await message.answer(f"✅ Все устройства для {email} успешно отвязаны.")
 
+# --- ЛОГИКА ПОДДЕРЖКИ (С АНТИ-СПАМОМ) ---
 @router.message(F.chat.id != ADMIN_ID)
 async def forward_to_admin(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -381,6 +383,16 @@ async def forward_to_admin(message: Message, state: FSMContext):
         return
 
     user = message.from_user
+    
+    # АНТИ-СПАМ (защита от флуда)
+    now = time.time()
+    last_time = user_last_message_time.get(user.id, 0)
+    if now - last_time < 30: # 30 секунд
+        await message.answer("⚠️ Пожалуйста, не спамьте. Мы уже получили ваше сообщение и скоро ответим.")
+        return
+    user_last_message_time[user.id] = now
+    # ------------------------
+
     safe_name = html.escape(user.full_name)
     
     admin_text_header = (
@@ -390,21 +402,26 @@ async def forward_to_admin(message: Message, state: FSMContext):
         f"🔗 Username: @{user.username or 'нет'}\n\n"
     )
     
+    # Кнопка закрытия обращения для админа
+    close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть обращение", callback_data=f"close_admin_{user.id}")]
+    ])
+    
     try:
         sent_msg = None
         if message.text:
             text = html.escape(message.text)
-            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + f"💬 Текст:\n{text}")
+            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + f"💬 Текст:\n{text}", reply_markup=close_keyboard)
         elif message.photo:
             caption = html.escape(message.caption) if message.caption else "Без подписи"
-            sent_msg = await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=admin_text_header + f"🖼 Фото:\n{caption}")
+            sent_msg = await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=admin_text_header + f"🖼 Фото:\n{caption}", reply_markup=close_keyboard)
         elif message.document:
             caption = html.escape(message.caption) if message.caption else "Без подписи"
-            sent_msg = await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=admin_text_header + f"📄 Документ:\n{caption}")
+            sent_msg = await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=admin_text_header + f"📄 Документ:\n{caption}", reply_markup=close_keyboard)
         elif message.video:
-            sent_msg = await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=admin_text_header + "🎥 Видео")
+            sent_msg = await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=admin_text_header + "🎥 Видео", reply_markup=close_keyboard)
         else:
-            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + "❓ Неизвестный тип сообщения")
+            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + "❓ Неизвестный тип сообщения", reply_markup=close_keyboard)
 
         if sent_msg:
             admin_reply_map[sent_msg.message_id] = user.id
@@ -420,18 +437,64 @@ async def reply_to_user(message: Message):
     target_user_id = admin_reply_map.get(reply_to_msg_id)
 
     if not target_user_id:
-        await message.answer("❌ Не могу определить, кому отправить этот ответ.")
+        await message.answer("❌ Не могу определить, кому отправить этот ответ (возможно, обращение уже закрыто).")
         return
+
+    # Кнопка закрытия для пользователя
+    user_close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Обращение закрыто", callback_data=f"close_user_{target_user_id}")]
+    ])
 
     try:
         if message.text:
             safe_reply = html.escape(message.text)
-            await bot.send_message(chat_id=target_user_id, text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}")
+            await bot.send_message(
+                chat_id=target_user_id, 
+                text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}", 
+                reply_markup=user_close_keyboard
+            )
             await message.answer("✅ Ответ отправлен пользователю.")
         else:
             await message.answer("⚠️ Пожалуйста, отвечайте текстом.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
+
+@router.callback_query(F.data.startswith("close_admin_"))
+async def close_ticket_admin(callback: CallbackQuery):
+    target_user_id = int(callback.data.split("_")[2])
+    
+    # Удаляем из мапы, чтобы нельзя было ответить
+    for msg_id, u_id in list(admin_reply_map.items()):
+        if u_id == target_user_id:
+            del admin_reply_map[msg_id]
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Обращение закрыто.")
+    
+    try:
+        await bot.send_message(
+            chat_id=target_user_id, 
+            text="🔒 <b>Ваше обращение в поддержку было закрыто.</b>\n\nЕсли у вас остались вопросы, вы можете создать новое обращение в главном меню."
+        )
+    except Exception:
+        pass
+
+@router.callback_query(F.data.startswith("close_user_"))
+async def close_ticket_user(callback: CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Спасибо! Обращение закрыто.")
+    
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID, 
+            text=f"✅ Пользователь @{callback.from_user.username or callback.from_user.id} закрыл обращение. (Поблагодарил)."
+        )
+    except Exception:
+        pass
+
+# ==========================================
+# ЛОГИКА ПОДПИСОК, ПЛАТЕЖЕЙ И API
+# ==========================================
 
 async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
     logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan})")
@@ -553,7 +616,7 @@ async def handle_create_amypay_payment(request):
 
         data = await request.json()
         plan_id = data.get('planId') 
-        promo_code = data.get('promoCode')
+        promo_code = data.get('promoCode', '').strip().upper() # Забираем промокод
 
         if not plan_id:
             return web.Response(text=json.dumps({"error": "No planId"}), status=400, content_type='application/json')
@@ -563,10 +626,10 @@ async def handle_create_amypay_payment(request):
             return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400, content_type='application/json')
 
         days = plan['duration_days']
-        amount = plan['price_rub']
+        amount = float(plan['price_rub']) # Исходная цена
         is_family = 'Семейная' in plan['name']
 
-        # Промокоды (если добавишь таблицу promocodes)
+        # ЛОГИКА ПРОМОКОДА
         if promo_code:
             headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
             async with ClientSession() as session:
@@ -575,6 +638,7 @@ async def handle_create_amypay_payment(request):
                     if promo_data:
                         discount = promo_data[0]['discount_percent']
                         amount = amount - (amount * discount / 100)
+                        logging.info(f"Применен промокод {promo_code}. Скидка {discount}%. Новая цена: {amount}")
 
         order_id = f"{real_user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}|sub"
         
@@ -585,7 +649,7 @@ async def handle_create_amypay_payment(request):
         }
         
         payload = {
-            "amount": int(amount), 
+            "amount": int(amount), # Amypay принимает целые числа
             "external_order_id": order_id,
             "description": f"EchoVPN Subscription ({days} days)"
         }
