@@ -375,7 +375,7 @@ async def process_successful_payment(user_id, days):
     }
     
     async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by", headers=headers_sb) as resp:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
                 logging.error(f"Профиль {user_id} не найден в базе.")
@@ -383,6 +383,7 @@ async def process_successful_payment(user_id, days):
             user_email = profile_data[0].get('email', 'user')
             current_expires_str = profile_data[0].get('subscription_expires_at')
             referred_by = profile_data[0].get('referred_by')
+            bonus_paid = profile_data[0].get('referral_bonus_paid', False)
         
         safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
         client_name = safe_email
@@ -447,7 +448,7 @@ async def process_successful_payment(user_id, days):
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
-            if referred_by:
+            if referred_by and not bonus_paid:
                 logging.info(f"Пользователь {user_id} был приглашен {referred_by}. Начисляем бонус пригласившему.")
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}&select=subscription_expires_at", headers=headers_sb) as ref_resp:
                     ref_data = await ref_resp.json()
@@ -459,12 +460,19 @@ async def process_successful_payment(user_id, days):
                             if ref_expires > now: ref_base_date = ref_expires
                         
                         ref_new_expires = ref_base_date + timedelta(days=7)
+                        
+                        # ИСПРАВЛЕНО: Добавили Content-Type для PATCH-запроса
+                        headers_patch_bonus = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
                         async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}", 
                                                  json={"subscription_expires_at": ref_new_expires.isoformat()}, 
-                                                 headers=headers_sb) as _:
-                            pass
+                                                 headers=headers_patch_bonus) as r:
+                            if r.status in [200, 204]:
+                                logging.info(f"Бонус успешно начислен пользователю {referred_by}")
+                            else:
+                                logging.error(f"Ошибка начисления бонуса: {await r.text()}")
                 
-                update_data["referred_by"] = None
+                # ИСПРАВЛЕНО: Вместо удаления связи ставим флаг, что бонус получен
+                update_data["referral_bonus_paid"] = True
 
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
