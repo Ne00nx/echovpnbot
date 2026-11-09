@@ -95,10 +95,8 @@ async def ask_email_for_buy(callback: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_for_email_buy)
 async def process_email_for_buy(message: Message, state: FSMContext):
     email = message.text.strip().lower()
-    
     user_temp_data[message.from_user.id] = {"email": email}
     await state.set_state(UserState.confirming_email_buy)
-    
     await message.answer(
         f"📧 Вы ввели: <b>{email}</b>\n\n"
         f"Все верно? Если да, нажмите кнопку ниже. Если ошиблись — введите email заново.",
@@ -120,7 +118,6 @@ async def confirm_email_no(callback: CallbackQuery, state: FSMContext):
 async def confirm_email_yes(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     email = user_temp_data.get(callback.from_user.id, {}).get("email")
-    
     if not email:
         await callback.message.edit_text("❌ Ошибка сессии. Начните заново.", reply_markup=get_user_menu())
         return
@@ -173,7 +170,6 @@ async def process_payment(callback: CallbackQuery):
     _, days_str, amount_str = callback.data.split("_")
     days = int(days_str)
     amount = float(amount_str)
-    
     target_id = user_temp_data.get(callback.from_user.id, {}).get("target_id")
     
     if not target_id:
@@ -185,7 +181,6 @@ async def process_payment(callback: CallbackQuery):
         "Authorization": f"Bearer {AMYPAY_API_KEY}",
         "Content-Type": "application/json"
     }
-    
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}"
     
     payload = {
@@ -577,9 +572,17 @@ async def handle_trial(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
-
+        device_id = data.get('deviceId', '')
+        
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
+        
+        # Получаем IP-адрес клиента (Cloudflare пробрасывает через X-Real-IP)
+        client_ip = request.headers.get('X-Real-IP', 'unknown')
+        if client_ip == 'unknown':
+            forwarded = request.headers.get('X-Forwarded-For')
+            if forwarded:
+                client_ip = forwarded.split(',')[0].strip()
 
         headers_sb = {
             "apikey": SUPABASE_SERVICE_KEY,
@@ -587,19 +590,52 @@ async def handle_trial(request):
         }
 
         async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=has_used_trial", headers=headers_sb) as resp:
+            # 1. Проверяем флаг у пользователя (email)
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=has_used_trial,email", headers=headers_sb) as resp:
                 profile = await resp.json()
-                
                 if not profile:
                     return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
-                    
                 if profile[0].get('has_used_trial'):
                     return web.Response(text=json.dumps({"error": "Trial already used"}), status=403, content_type='application/json')
+                user_email = profile[0].get('email', '')
 
+            # 2. Проверяем по Device ID
+            if device_id:
+                async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?device_id=eq.{device_id}&select=id", headers=headers_sb) as resp:
+                    device_logs = await resp.json()
+                    if device_logs:
+                        # Помечаем что этот аккаунт тоже "использован"
+                        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                                 json={"has_used_trial": True}, 
+                                                 headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as r:
+                            pass
+                        return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403, content_type='application/json')
+
+            # 3. Проверяем по IP (максимум 3 триала с одного IP)
+            if client_ip != 'unknown':
+                async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?ip_address=eq.{client_ip}&select=id", headers=headers_sb) as resp:
+                    ip_logs = await resp.json()
+                    if len(ip_logs) >= 3:
+                        return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403, content_type='application/json')
+
+            # 4. Все проверки пройдены — выдаем триал
             await process_successful_payment(user_id, 7)
-            
-            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"has_used_trial": True}, headers=headers_patch) as resp:
+
+            # 5. Логируем
+            log_data = {
+                "user_id": user_id,
+                "device_id": device_id,
+                "ip_address": client_ip,
+                "email": user_email
+            }
+            async with session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, 
+                                    headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+                pass
+
+            # 6. Ставим флаг у профиля
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                     json={"has_used_trial": True}, 
+                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
