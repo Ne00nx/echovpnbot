@@ -181,6 +181,7 @@ async def process_payment(callback: CallbackQuery):
         "Authorization": f"Bearer {AMYPAY_API_KEY}",
         "Content-Type": "application/json"
     }
+    
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}"
     
     payload = {
@@ -228,7 +229,7 @@ async def process_email_status(message: Message, state: FSMContext):
     }
     
     async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=subscription_plan,subscription_expires_at", headers=headers_sb) as resp:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=subscription_plan,subscription_expires_at,family_owner_id", headers=headers_sb) as resp:
             data = await resp.json()
             
     if not data:
@@ -239,6 +240,15 @@ async def process_email_status(message: Message, state: FSMContext):
     expires_at_str = profile.get('subscription_expires_at')
     plan = profile.get('subscription_plan')
     
+    # Если это семейный аккаунт, проверяем срок владельца
+    if profile.get('family_owner_id'):
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{profile['family_owner_id']}&select=subscription_expires_at", headers=headers_sb) as resp:
+                owner_data = await resp.json()
+                if owner_data and owner_data[0].get('subscription_expires_at'):
+                    expires_at_str = owner_data[0]['subscription_expires_at']
+                    plan = 'premium'
+
     if plan == 'premium' and expires_at_str:
         expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
         now = datetime.now(timezone.utc)
@@ -366,13 +376,14 @@ async def process_successful_payment(user_id, days):
     }
     
     async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at", headers=headers_sb) as resp:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by", headers=headers_sb) as resp:
             profile_data = await resp.json()
             if not profile_data:
                 logging.error(f"Профиль {user_id} не найден в базе.")
                 return
             user_email = profile_data[0].get('email', 'user')
             current_expires_str = profile_data[0].get('subscription_expires_at')
+            referred_by = profile_data[0].get('referred_by')
         
         safe_email = user_email.split('@')[0].replace('.', '_').replace('-', '_')
         client_name = safe_email
@@ -436,6 +447,29 @@ async def process_successful_payment(user_id, days):
 
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
+            
+            # ОБРАБОТКА РЕФЕРАЛЬНОГО БОНУСА
+            if referred_by:
+                logging.info(f"Пользователь {user_id} был приглашен {referred_by}. Начисляем бонус пригласившему.")
+                # Начисляем 7 дней пригласившему
+                async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}&select=subscription_expires_at", headers=headers_sb) as ref_resp:
+                    ref_data = await ref_resp.json()
+                    if ref_data:
+                        ref_expires_str = ref_data[0].get('subscription_expires_at')
+                        ref_base_date = now
+                        if ref_expires_str:
+                            ref_expires = datetime.fromisoformat(ref_expires_str.replace('Z', '+00:00'))
+                            if ref_expires > now: ref_base_date = ref_expires
+                        
+                        ref_new_expires = ref_base_date + timedelta(days=7)
+                        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}", 
+                                                 json={"subscription_expires_at": ref_new_expires.isoformat()}, 
+                                                 headers=headers_sb) as _:
+                            pass
+                
+                # Убираем привязку, чтобы бонус не начислялся дважды за одного пользователя
+                update_data["referred_by"] = None
+
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
                 if resp.status not in [200, 204]:
@@ -577,7 +611,6 @@ async def handle_trial(request):
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
         
-        # Получаем IP-адрес клиента (Cloudflare пробрасывает через X-Real-IP)
         client_ip = request.headers.get('X-Real-IP', 'unknown')
         if client_ip == 'unknown':
             forwarded = request.headers.get('X-Forwarded-For')
@@ -590,7 +623,6 @@ async def handle_trial(request):
         }
 
         async with ClientSession() as session:
-            # 1. Проверяем флаг у пользователя (email)
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=has_used_trial,email", headers=headers_sb) as resp:
                 profile = await resp.json()
                 if not profile:
@@ -599,48 +631,76 @@ async def handle_trial(request):
                     return web.Response(text=json.dumps({"error": "Trial already used"}), status=403, content_type='application/json')
                 user_email = profile[0].get('email', '')
 
-            # 2. Проверяем по Device ID
             if device_id:
                 async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?device_id=eq.{device_id}&select=id", headers=headers_sb) as resp:
                     device_logs = await resp.json()
                     if device_logs:
-                        # Помечаем что этот аккаунт тоже "использован"
                         async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
                                                  json={"has_used_trial": True}, 
                                                  headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as r:
                             pass
                         return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403, content_type='application/json')
 
-            # 3. Проверяем по IP (максимум 3 триала с одного IP)
             if client_ip != 'unknown':
                 async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?ip_address=eq.{client_ip}&select=id", headers=headers_sb) as resp:
                     ip_logs = await resp.json()
                     if len(ip_logs) >= 3:
                         return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403, content_type='application/json')
 
-            # 4. Все проверки пройдены — выдаем триал
             await process_successful_payment(user_id, 7)
 
-            # 5. Логируем
-            log_data = {
-                "user_id": user_id,
-                "device_id": device_id,
-                "ip_address": client_ip,
-                "email": user_email
-            }
-            async with session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, 
-                                    headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+            log_data = {"user_id": user_id, "device_id": device_id, "ip_address": client_ip, "email": user_email}
+            async with session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
 
-            # 6. Ставим флаг у профиля
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
-                                     json={"has_used_trial": True}, 
-                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"has_used_trial": True}, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
         logging.error(f"Ошибка активации триала: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_apply_referral(request):
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        referral_code = data.get('referralCode')
+        
+        if not user_id or not referral_code:
+            return web.Response(text="Bad Request", status=400)
+            
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            # 1. Проверяем, не использовал ли уже этот пользователь реферальный код
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=referred_by", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if user_data and user_data[0].get('referred_by'):
+                    return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400, content_type='application/json')
+                    
+            # 2. Ищем владельца кода
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{referral_code}&select=id", headers=headers_sb) as resp:
+                referrer_data = await resp.json()
+                if not referrer_data:
+                    return web.Response(text=json.dumps({"error": "Invalid referral code"}), status=404, content_type='application/json')
+                
+                referrer_id = referrer_data[0]['id']
+                
+                if referrer_id == user_id:
+                    return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400, content_type='application/json')
+
+            # 3. Привязываем пользователя к рефереру
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                     json={"referred_by": referrer_id}, 
+                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+                pass
+                
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def start_web_server():
@@ -650,6 +710,7 @@ async def start_web_server():
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
     app.router.add_post('/api/check-pending', handle_check_pending)
     app.router.add_post('/api/trial', handle_trial)
+    app.router.add_post('/api/apply-referral', handle_apply_referral)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
