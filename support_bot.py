@@ -711,13 +711,11 @@ async def handle_join_family(request):
         }
         
         async with ClientSession() as session:
-            # Проверяем, не привязан ли уже к семье
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=family_owner_id", headers=headers_sb) as resp:
                 user_data = await resp.json()
                 if user_data and user_data[0].get('family_owner_id'):
                     return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
                     
-            # Ищем владельца по коду
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{family_code}&select=id", headers=headers_sb) as resp:
                 owner_data = await resp.json()
                 if not owner_data:
@@ -728,7 +726,6 @@ async def handle_join_family(request):
                 if owner_id == user_id:
                     return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400, content_type='application/json')
 
-            # Привязываем пользователя к семье
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
                                      json={"family_owner_id": owner_id}, 
                                      headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
