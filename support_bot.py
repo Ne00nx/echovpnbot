@@ -392,10 +392,8 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
         now = datetime.now(timezone.utc)
         
         if family_owner_expires:
-            # Если это участник семьи, его срок = сроку владельца
             new_expires = family_owner_expires
         else:
-            # Обычная логика начисления дней
             if current_expires_str:
                 current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
                 base_date = current_expires if current_expires > now else now
@@ -455,13 +453,11 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
-            # Генерация семейного кода при покупке семейного тарифа
             if is_family_plan and not current_family_code:
                 new_family_code = hashlib.md5(f"{user_id}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
                 update_data["family_code"] = new_family_code
                 logging.info(f"Сгенерирован семейный код {new_family_code} для {user_id}")
 
-            # Логика реферального бонуса
             if not is_bonus and referred_by and not bonus_paid:
                 logging.info(f"Пользователь {user_id} оплатил подписку. Начисляем бонус пригласившему {referred_by}.")
                 update_data["referral_bonus_paid"] = True
@@ -479,7 +475,6 @@ async def handle_create_amypay_payment(request):
         days = data.get('days', 30)
         amount = float(data.get('amount', 249.00))
         is_family = data.get('isFamily', False)
-        logging.info(f"Создание платежа: userId={user_id}, days={days}, amount={amount}, isFamily={is_family}")
 
         if not user_id:
             return web.Response(text=json.dumps({"error": "No userId"}), status=400, content_type='application/json')
@@ -715,13 +710,11 @@ async def handle_join_family(request):
         }
         
         async with ClientSession() as session:
-            # 1. Проверяем, не в семье ли уже
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=family_owner_id", headers=headers_sb) as resp:
                 user_data = await resp.json()
                 if user_data and user_data[0].get('family_owner_id'):
                     return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
                     
-            # 2. Ищем владельца по family_code
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_code=eq.{family_code}&select=id,subscription_expires_at", headers=headers_sb) as resp:
                 owner_data = await resp.json()
                 if not owner_data:
@@ -736,13 +729,11 @@ async def handle_join_family(request):
                 if not owner_expires_str:
                      return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400, content_type='application/json')
 
-            # 3. ПРОВЕРКА ЛИМИТА: Считаем, сколько человек уже в семье
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{owner_id}&select=id", headers=headers_sb) as resp:
                 members = await resp.json()
-                if len(members) >= 2: # Владелец + 2 участника = 3 аккаунта
+                if len(members) >= 2:
                     return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400, content_type='application/json')
 
-                # 4. Считаем дни владельца
                 now = datetime.now(timezone.utc)
                 owner_expires = datetime.fromisoformat(owner_expires_str.replace('Z', '+00:00'))
                 days_left = (owner_expires - now).days
@@ -750,14 +741,64 @@ async def handle_join_family(request):
                 if days_left <= 0:
                     return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400, content_type='application/json')
 
-            # 5. Привязываем к семье
             async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
                                      json={"family_owner_id": owner_id}, 
                                      headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
                 pass
             
-            # 6. Выдаем ключи новому участнику на срок владельца
             await process_successful_payment(user_id, days_left, is_bonus=True, family_owner_expires=owner_expires)
+                
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_remove_family_member(request):
+    try:
+        data = await request.json()
+        owner_id = data.get('ownerId')
+        member_id = data.get('memberId')
+        
+        if not owner_id or not member_id:
+            return web.Response(text="Bad Request", status=400)
+            
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}&select=family_owner_id", headers=headers_sb) as resp:
+                data = await resp.json()
+                if not data or data[0].get('family_owner_id') != owner_id:
+                    return web.Response(text=json.dumps({"error": "User is not in your family"}), status=400, content_type='application/json')
+
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}", 
+                                     json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None}, 
+                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+                pass
+                
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_leave_family(request):
+    try:
+        data = await request.json()
+        user_id = data.get('userId')
+        
+        if not user_id:
+            return web.Response(text="Bad Request", status=400)
+            
+        headers_sb = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+        }
+        
+        async with ClientSession() as session:
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
+                                     json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None}, 
+                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+                pass
                 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
@@ -772,6 +813,8 @@ async def start_web_server():
     app.router.add_post('/api/trial', handle_trial)
     app.router.add_post('/api/apply-referral', handle_apply_referral)
     app.router.add_post('/api/join-family', handle_join_family)
+    app.router.add_post('/api/remove-family-member', handle_remove_family_member)
+    app.router.add_post('/api/leave-family', handle_leave_family)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
