@@ -461,17 +461,19 @@ async def process_successful_payment(user_id, days):
                         
                         ref_new_expires = ref_base_date + timedelta(days=7)
                         
-                        # ИСПРАВЛЕНО: Добавили Content-Type для PATCH-запроса
+                        # ИСПРАВЛЕНО: Добавляем subscription_plan = premium пригласившему
                         headers_patch_bonus = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
                         async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{referred_by}", 
-                                                 json={"subscription_expires_at": ref_new_expires.isoformat()}, 
+                                                 json={
+                                                     "subscription_expires_at": ref_new_expires.isoformat(),
+                                                     "subscription_plan": "premium"
+                                                 }, 
                                                  headers=headers_patch_bonus) as r:
                             if r.status in [200, 204]:
                                 logging.info(f"Бонус успешно начислен пользователю {referred_by}")
                             else:
                                 logging.error(f"Ошибка начисления бонуса: {await r.text()}")
                 
-                # ИСПРАВЛЕНО: Вместо удаления связи ставим флаг, что бонус получен
                 update_data["referral_bonus_paid"] = True
 
             headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
@@ -669,7 +671,6 @@ async def handle_apply_referral(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
-        # ИСПРАВЛЕНО: Приводим код к нижнему регистру
         referral_code = data.get('referralCode', '').strip().lower()
         
         if not user_id or not referral_code:
@@ -709,7 +710,6 @@ async def handle_join_family(request):
     try:
         data = await request.json()
         user_id = data.get('userId')
-        # ИСПРАВЛЕНО: Приводим код к нижнему регистру
         family_code = data.get('familyCode', '').strip().lower()
         
         if not user_id or not family_code:
