@@ -96,6 +96,20 @@ async def get_plan_from_db(plan_id):
         logging.error(f"Ошибка получения тарифа: {e}")
     return None
 
+async def get_discount_config():
+    """Возвращает (discount_enabled, discount_percent)"""
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    try:
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=discount_enabled,discount_percent", headers=headers_sb, timeout=5) as resp:
+                data = await resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    cfg = data[0]
+                    return bool(cfg.get('discount_enabled')), int(cfg.get('discount_percent', 0))
+    except Exception as e:
+        logging.error(f"Ошибка получения конфига скидки: {e}")
+    return False, 0
+
 async def check_amypay_token():
     if not AMYPAY_API_KEY or IS_TEST_MODE: return
     url = "https://amypay.ru/api/v2/ping"
@@ -203,6 +217,10 @@ async def confirm_email_yes(callback: CallbackQuery, state: FSMContext):
 
 async def show_plans(message: Message):
     headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    
+    # Читаем конфиг со скидкой
+    discount_enabled, discount_percent = await get_discount_config()
+    
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/plans?is_active=eq.true&order=duration_days.asc", headers=headers_sb) as resp:
             plans = await resp.json()
@@ -213,13 +231,30 @@ async def show_plans(message: Message):
 
     keyboard = []
     for plan in plans:
+        original_price = int(plan['price_rub'])
+        
+        if discount_enabled and discount_percent > 0:
+            new_price = round(original_price * (100 - discount_percent) / 100)
+            btn_text = f"{plan['name']} — {new_price} ₽ (было {original_price} ₽)"
+        else:
+            btn_text = f"{plan['name']} — {original_price} ₽"
+        
         keyboard.append([InlineKeyboardButton(
-            text=f"{plan['name']} — {plan['price_rub']} ₽", 
+            text=btn_text,
             callback_data=f"pay_{plan['id']}"
         )])
     
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
-    await message.answer("💳 <b>Выберите тариф для покупки:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    
+    if discount_enabled and discount_percent > 0:
+        header_text = (
+            f"🔥 <b>СКИДКА {discount_percent}% НА ВСЕ ТАРИФЫ!</b>\n\n"
+            f"💳 <b>Выберите тариф для покупки:</b>"
+        )
+    else:
+        header_text = "💳 <b>Выберите тариф для покупки:</b>"
+    
+    await message.answer(header_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 @router.callback_query(F.data.startswith("pay_"))
 async def process_payment(callback: CallbackQuery):
@@ -236,21 +271,15 @@ async def process_payment(callback: CallbackQuery):
         return
 
     days = plan['duration_days']
-    amount = float(plan['price_rub'])
+    original_amount = float(plan['price_rub'])
+    amount = original_amount
     is_family = 'Семейная' in plan['name']
     
-    # --- ПРИМЕНЕНИЕ ГЛОБАЛЬНОЙ СКИДКИ ---
-    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
-    async with ClientSession() as session:
-        async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=discount_enabled,discount_percent", headers=headers_sb) as resp:
-            config_data = await resp.json()
-            if isinstance(config_data, list) and len(config_data) > 0:
-                cfg = config_data[0]
-                if cfg.get('discount_enabled') and cfg.get('discount_percent', 0) > 0:
-                    disc = float(cfg['discount_percent'])
-                    amount = amount - (amount * disc / 100)
-    # -------------------------------------
-
+    # Применяем глобальную скидку
+    discount_enabled, discount_percent = await get_discount_config()
+    if discount_enabled and discount_percent > 0:
+        amount = amount - (amount * discount_percent / 100)
+    
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}|sub"
     
     pay_url = ""
@@ -271,7 +300,18 @@ async def process_payment(callback: CallbackQuery):
             [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
         ])
-        await callback.message.edit_text(f"✅ Заказ на <b>{days} дней</b> (Сумма: {int(amount)} ₽) создан!\n\nНажмите кнопку ниже, чтобы оплатить.", reply_markup=keyboard)
+        
+        if discount_enabled and discount_percent > 0:
+            sum_text = f"<s>{int(original_amount)} ₽</s> <b>{int(amount)} ₽</b> (скидка {discount_percent}%)"
+        else:
+            sum_text = f"<b>{int(amount)} ₽</b>"
+        
+        await callback.message.edit_text(
+            f"✅ Заказ на <b>{days} дней</b> создан!\n\n"
+            f"Сумма: {sum_text}\n\n"
+            f"Нажмите кнопку ниже, чтобы оплатить.",
+            reply_markup=keyboard
+        )
     else:
         await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
 
@@ -591,16 +631,10 @@ async def handle_create_amypay_payment(request):
         amount = float(plan['price_rub'])
         is_family = 'Семейная' in plan['name']
 
-        # --- ПРИМЕНЕНИЕ ГЛОБАЛЬНОЙ СКИДКИ ---
-        async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=discount_enabled,discount_percent", headers=headers_sb) as resp:
-                config_data = await resp.json()
-                if isinstance(config_data, list) and len(config_data) > 0:
-                    cfg = config_data[0]
-                    if cfg.get('discount_enabled') and cfg.get('discount_percent', 0) > 0:
-                        disc = float(cfg['discount_percent'])
-                        amount = amount - (amount * disc / 100)
-        # -------------------------------------
+        # Применяем глобальную скидку
+        discount_enabled, discount_percent = await get_discount_config()
+        if discount_enabled and discount_percent > 0:
+            amount = amount - (amount * discount_percent / 100)
 
         if promo_code:
             async with ClientSession() as session:
@@ -1211,20 +1245,17 @@ async def handle_admin_change_password(request):
         if not email:
             return web.Response(text=json.dumps({"error": "Email required"}), status=400, content_type='application/json')
 
-        # Генерируем случайный пароль (10 символов: буквы и цифры)
         chars = string.ascii_letters + string.digits
         new_password = ''.join(random.choice(chars) for _ in range(10))
 
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
-            # Получаем ID пользователя
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
                 user_data = await resp.json()
                 if not isinstance(user_data, list) or not user_data:
                     return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
                 user_id = user_data[0]['id']
 
-            # Меняем пароль через Admin API
             async with session.put(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", json={"password": new_password}, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
                 if resp.status in [200, 201]:
                     return web.Response(text=json.dumps({"success": True, "new_password": new_password}), status=200, content_type='application/json')
@@ -1340,7 +1371,6 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     
-    # Роуты для мобильного приложения
     app.router.add_post('/api/amypay/create-payment', handle_create_amypay_payment)
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
     app.router.add_get('/api/fake-pay', handle_fake_pay)
@@ -1354,7 +1384,6 @@ async def start_web_server():
     app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
     app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring)
 
-    # Роуты для админки
     app.router.add_post('/api/admin/users', handle_admin_get_users)
     app.router.add_post('/api/admin/give-days', handle_admin_give_days)
     app.router.add_post('/api/admin/reset-device', handle_admin_reset_device)
@@ -1362,15 +1391,13 @@ async def start_web_server():
     app.router.add_post('/api/admin/push', handle_admin_push)
     app.router.add_post('/api/admin/delete-user', handle_admin_delete_user)
     app.router.add_post('/api/admin/change-password', handle_admin_change_password)
-    app.router.add_get('/api/admin/config', handle_admin_get_config)         
-    app.router.add_patch('/api/admin/config', handle_admin_update_config)    
-    
+    app.router.add_get('/api/admin/config', handle_admin_get_config)
+    app.router.add_patch('/api/admin/config', handle_admin_update_config)
     app.router.add_get('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_post('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_patch('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_delete('/api/admin/promocodes', handle_admin_promocodes)
 
-    # --- НАСТРОЙКА CORS ДЛЯ FLUTTER WEB ---
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -1382,7 +1409,6 @@ async def start_web_server():
 
     for route in list(app.router.routes()):
         cors.add(route)
-    # --------------------------------------
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
@@ -1400,4 +1426,4 @@ async def main():
         raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    await main()
