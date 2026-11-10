@@ -25,8 +25,6 @@ from firebase_admin import credentials, messaging
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
 APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ' 
-PRIVACY_URL = 'https://telegra.ph/Politika-konfidencialnosti-EchoVPN-11-07'
-OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 
 # ИСПРАВЛЕНО: Убираем слэш в конце (защита от PGRST125)
 SUPABASE_URL = (os.getenv('SUPABASE_URL') or '').rstrip('/')
@@ -115,7 +113,6 @@ async def check_amypay_token():
     except Exception as e:
         logging.error(f"Ошибка проверки ключа Amypay: {e}")
 
-# ИСПРАВЛЕНО: Асинхронная отправка пушей (не блокирует event loop)
 async def send_push_notification(fcm_token, title, body):
     if not fcm_token: return
     try:
@@ -536,22 +533,22 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
 async def handle_create_amypay_payment(request):
     try:
         real_user_id, _ = await get_user_from_token(request)
-        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
 
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=family_owner_id", headers=headers_sb) as resp:
                 if (await resp.json())[0].get('family_owner_id'):
-                    return web.Response(text=json.dumps({"error": "Вы состоите в семейной подписке. Выйдите из семьи, чтобы купить личную."}), status=403)
+                    return web.Response(text=json.dumps({"error": "Вы состоите в семейной подписке. Выйдите из семьи, чтобы купить личную."}), status=403, content_type='application/json')
 
         data = await request.json()
         plan_id = data.get('planId') 
         promo_code = data.get('promoCode', '').strip().upper()
 
-        if not plan_id: return web.Response(text=json.dumps({"error": "No planId"}), status=400)
+        if not plan_id: return web.Response(text=json.dumps({"error": "No planId"}), status=400, content_type='application/json')
 
         plan = await get_plan_from_db(plan_id)
-        if not plan: return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400)
+        if not plan: return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400, content_type='application/json')
 
         days = plan['duration_days']
         amount = float(plan['price_rub'])
@@ -569,7 +566,7 @@ async def handle_create_amypay_payment(request):
         # ИСПРАВЛЕНО: Проверка на тестовый режим (Stage)
         if IS_TEST_MODE:
             fake_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={int(amount)}"
-            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200)
+            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200, content_type='application/json')
 
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
@@ -579,17 +576,17 @@ async def handle_create_amypay_payment(request):
             async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
                 resp_data = await resp.json()
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200)
-                return web.Response(text=json.dumps({"error": "Failed to create order"}), status=500)
+                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({"error": "Failed to create order"}), status=500, content_type='application/json')
                 
     except Exception as e:
         logging.error(f"Error create payment: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_buy_device_slot(request):
     try:
         real_user_id, _ = await get_user_from_token(request)
-        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
             
         amount = 99 
         order_id = f"{real_user_id}|0|{int(datetime.now().timestamp())}|0|false|device" 
@@ -597,7 +594,7 @@ async def handle_buy_device_slot(request):
         # ИСПРАВЛЕНО: Проверка на тестовый режим (Stage)
         if IS_TEST_MODE:
             fake_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={amount}"
-            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200)
+            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200, content_type='application/json')
 
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
@@ -607,10 +604,10 @@ async def handle_buy_device_slot(request):
             async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
                 resp_data = await resp.json()
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200)
-        return web.Response(text=json.dumps({"error": "Failed"}), status=500)
+                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"error": "Failed"}), status=500, content_type='application/json')
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_fake_pay(request):
     """Фейковая страница оплаты для Stage"""
@@ -745,42 +742,42 @@ async def handle_check_pending(request):
 async def handle_check_device(request):
     try:
         real_user_id, _ = await get_user_from_token(request)
-        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
             
         data = await request.json()
         device_id = data.get('deviceId')
         device_name = data.get('deviceName', 'Устройство') 
-        if not device_id: return web.Response(text=json.dumps({"error": "No deviceId"}), status=400)
+        if not device_id: return web.Response(text=json.dumps({"error": "No deviceId"}), status=400, content_type='application/json')
 
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=active_devices,max_devices_allowed", headers=headers_sb) as resp:
                 profile = await resp.json()
                 
-            if not profile: return web.Response(text=json.dumps({"error": "Profile not found"}), status=404)
+            if not profile: return web.Response(text=json.dumps({"error": "Profile not found"}), status=404, content_type='application/json')
             
             active_devices = profile[0].get('active_devices') or []
             max_allowed = profile[0].get('max_devices_allowed') or 2
             
             if not any(d.get('id') == device_id for d in active_devices):
                 if len(active_devices) >= max_allowed:
-                    return web.Response(text=json.dumps({"error": "Device limit reached"}), status=403)
+                    return web.Response(text=json.dumps({"error": "Device limit reached"}), status=403, content_type='application/json')
                 
                 active_devices.append({"id": device_id, "name": device_name})
                 async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"active_devices": active_devices}, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as patch_resp: pass
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
         logging.error(f"Error check device: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_trial(request):
     try:
         real_user_id, user_email = await get_user_from_token(request)
-        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
 
         data = await request.json()
         device_id = data.get('deviceId', '')
-        if not device_id: return web.Response(text=json.dumps({"error": "Device ID required"}), status=400)
+        if not device_id: return web.Response(text=json.dumps({"error": "Device ID required"}), status=400, content_type='application/json')
 
         client_ip = request.headers.get('X-Real-IP', 'unknown')
         if client_ip == 'unknown':
@@ -793,23 +790,23 @@ async def handle_trial(request):
             # Проверка has_used_trial в профиле
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=has_used_trial", headers=headers_sb) as resp:
                 if (await resp.json())[0].get('has_used_trial'):
-                    return web.Response(text=json.dumps({"error": "Trial already used"}), status=403)
+                    return web.Response(text=json.dumps({"error": "Trial already used"}), status=403, content_type='application/json')
 
             # Проверка по device_id
             async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?device_id=eq.{device_id}", headers=headers_sb) as resp:
                 if await resp.json():
-                    return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403)
+                    return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403, content_type='application/json')
             
             # ИСПРАВЛЕНО: Проверка по email
             async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?email=eq.{user_email}", headers=headers_sb) as resp:
                 if await resp.json():
-                    return web.Response(text=json.dumps({"error": "Trial already used with this email"}), status=403)
+                    return web.Response(text=json.dumps({"error": "Trial already used with this email"}), status=403, content_type='application/json')
 
             # Проверка по IP
             if client_ip != 'unknown':
                 async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?ip_address=eq.{client_ip}", headers=headers_sb) as resp:
                     if len(await resp.json()) >= 3:
-                        return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403)
+                        return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403, content_type='application/json')
 
             await process_successful_payment(real_user_id, 7)
 
@@ -817,10 +814,10 @@ async def handle_trial(request):
             await session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, headers={**headers_sb, "Content-Type": "application/json"})
             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"has_used_trial": True}, headers={**headers_sb, "Content-Type": "application/json"})
 
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
         logging.error(f"Ошибка активации триала: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_apply_referral(request):
     try:
@@ -830,29 +827,29 @@ async def handle_apply_referral(request):
         data = await request.json()
         referral_code = data.get('referralCode', '').strip().lower()
         if not re.fullmatch(r'[a-f0-9]{8}', referral_code):
-            return web.Response(text=json.dumps({"error": "Invalid code format"}), status=400)
+            return web.Response(text=json.dumps({"error": "Invalid code format"}), status=400, content_type='application/json')
             
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=referred_by", headers=headers_sb) as resp:
                 if (await resp.json())[0].get('referred_by'):
-                    return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400, content_type='application/json')
                     
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{referral_code}&select=id", headers=headers_sb) as resp:
                 referrer_data = await resp.json()
                 if not referrer_data:
-                    return web.Response(text=json.dumps({"error": "Invalid referral code"}), status=404)
+                    return web.Response(text=json.dumps({"error": "Invalid referral code"}), status=404, content_type='application/json')
                 
                 referrer_id = referrer_data[0]['id']
                 if referrer_id == real_user_id:
-                    return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400, content_type='application/json')
 
             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"referred_by": referrer_id}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_join_family(request):
     try:
@@ -868,39 +865,39 @@ async def handle_join_family(request):
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=family_owner_id", headers=headers_sb) as resp:
                 if (await resp.json())[0].get('family_owner_id'):
-                    return web.Response(text=json.dumps({"error": "Already in a family"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
                     
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_code=eq.{family_code}&select=id,subscription_expires_at", headers=headers_sb) as resp:
                 owner_data = await resp.json()
                 if not owner_data:
-                    return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404)
+                    return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404, content_type='application/json')
                 
                 owner_id = owner_data[0]['id']
                 owner_expires_str = owner_data[0].get('subscription_expires_at')
                 
                 if owner_id == real_user_id:
-                    return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400, content_type='application/json')
                 if not owner_expires_str:
-                     return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400)
+                     return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400, content_type='application/json')
 
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{owner_id}&select=id", headers=headers_sb) as resp:
                 members = await resp.json()
                 if len(members) >= 2:
-                    return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400, content_type='application/json')
 
                 now = datetime.now(timezone.utc)
                 owner_expires = datetime.fromisoformat(owner_expires_str.replace('Z', '+00:00'))
                 days_left = (owner_expires - now).days
                 
                 if days_left <= 0:
-                    return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400)
+                    return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400, content_type='application/json')
 
             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"family_owner_id": owner_id}, headers={**headers_sb, "Content-Type": "application/json"})
             await process_successful_payment(real_user_id, days_left, is_bonus=True, family_owner_expires=owner_expires)
                 
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_remove_family_member(request):
     try:
@@ -917,13 +914,13 @@ async def handle_remove_family_member(request):
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}&select=family_owner_id", headers=headers_sb) as resp:
                 m_data = await resp.json()
                 if not m_data or m_data[0].get('family_owner_id') != real_user_id:
-                    return web.Response(text=json.dumps({"error": "User is not in your family"}), status=400)
+                    return web.Response(text=json.dumps({"error": "User is not in your family"}), status=400, content_type='application/json')
 
             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}", json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None, "subscription_expires_at": None}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_leave_family(request):
     try:
@@ -934,9 +931,9 @@ async def handle_leave_family(request):
         async with ClientSession() as session:
             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None, "subscription_expires_at": None}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_cron_expiring(request):
     try:
