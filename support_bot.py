@@ -16,6 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web, ClientSession
+import aiohttp_cors # <--- ДОБАВЛЕНО ДЛЯ CORS
 
 # --- FIREBASE IMPORTS ---
 import firebase_admin
@@ -1206,6 +1207,20 @@ async def start_web_server():
     app.router.add_post('/api/admin/kick-family', handle_admin_kick_family)
     app.router.add_post('/api/admin/push', handle_admin_push)
     app.router.add_route('*', '/api/admin/promocodes', handle_admin_promocodes)
+
+    # --- НАСТРОЙКА CORS ДЛЯ FLUTTER WEB ---
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+
+    for route in list(app.router.routes()):
+        cors.add(route)
+    # --------------------------------------
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
