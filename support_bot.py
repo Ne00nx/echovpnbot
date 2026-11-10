@@ -74,6 +74,10 @@ async def get_user_id_from_token(request):
                 if resp.status == 200:
                     user_data = await resp.json()
                     return user_data.get('id')
+                else:
+                    # ДОБАВЛЕНО: Выводим ошибку от Supabase в логи Render
+                    error_text = await resp.text()
+                    logging.error(f"Ошибка проверки JWT: {resp.status} - {error_text}")
     except Exception as e:
         logging.error(f"Ошибка валидации JWT: {e}")
     return None
