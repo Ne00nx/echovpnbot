@@ -455,13 +455,8 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code,fcm_token", headers=headers_sb) as resp:
                 profile_data = await resp.json()
-                
-                # ЗАЩИТА ОТ ОШИБОК СУПАБЕЙС
-                if not isinstance(profile_data, list):
-                    logging.error(f"Ошибка Supabase при получении профиля: {profile_data}")
-                    return
-                if not profile_data:
-                    logging.error(f"Профиль {user_id} не найден")
+                if not isinstance(profile_data, list) or not profile_data:
+                    logging.error(f"Профиль {user_id} не найден или ошибка: {profile_data}")
                     return
                 
                 p = profile_data[0]
@@ -494,6 +489,20 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
             generated_urls = {}
 
             async def create_on_server(server):
+                domain = server['domain']
+                pbk = server['pbk']
+                sid = server['sid']
+                flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') != 'ES' else ""
+                
+                # Формируем ссылку для клиента
+                url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none{flow_str}#EchoVPN-{server['name']}"
+
+                # ИСПРАВЛЕНИЕ: Если включен тестовый режим, не стучимся к реальной панели X-UI
+                if IS_TEST_MODE:
+                    logging.info(f"[TEST MODE] Пропускаем запрос к серверу {server['name']}. Генерируем фейковую ссылку.")
+                    return server['id'], url.replace(' ', '').replace('\n', '')
+
+                # Далее - боевой режим
                 headers_xui = {"Content-Type": "application/json", "Authorization": f"Bearer {server['api_token']}", "X-API-Key": server['api_token']}
                 base_url = server['api_url'].replace('/create', '')
                 
@@ -506,9 +515,6 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                 try:
                     async with session.post(server['api_url'], json=payload, headers=headers_xui, timeout=5) as resp:
                         if resp.status in [200, 201]:
-                            domain, pbk, sid = server['domain'], server['pbk'], server['sid']
-                            flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') != 'ES' else ""
-                            url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none{flow_str}#EchoVPN-{server['name']}"
                             return server['id'], url.replace(' ', '').replace('\n', '')
                 except Exception as e:
                     logging.error(f"Ошибка создания на сервере {server.get('name')}: {e}")
