@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web, ClientSession
-import aiohttp_cors # <--- ДОБАВЛЕНО ДЛЯ CORS
+import aiohttp_cors
 
 # --- FIREBASE IMPORTS ---
 import firebase_admin
@@ -1200,13 +1200,17 @@ async def start_web_server():
     app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
     app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring)
 
-    # Роуты для админки
+    # Роуты для админки (ИСПРАВЛЕНО: конкретные методы вместо '*')
     app.router.add_post('/api/admin/users', handle_admin_get_users)
     app.router.add_post('/api/admin/give-days', handle_admin_give_days)
     app.router.add_post('/api/admin/reset-device', handle_admin_reset_device)
     app.router.add_post('/api/admin/kick-family', handle_admin_kick_family)
     app.router.add_post('/api/admin/push', handle_admin_push)
-    app.router.add_route('*', '/api/admin/promocodes', handle_admin_promocodes)
+    
+    app.router.add_get('/api/admin/promocodes', handle_admin_promocodes)
+    app.router.add_post('/api/admin/promocodes', handle_admin_promocodes)
+    app.router.add_patch('/api/admin/promocodes', handle_admin_promocodes)
+    app.router.add_delete('/api/admin/promocodes', handle_admin_promocodes)
 
     # --- НАСТРОЙКА CORS ДЛЯ FLUTTER WEB ---
     cors = aiohttp_cors.setup(app, defaults={
