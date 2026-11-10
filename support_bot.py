@@ -6,6 +6,7 @@ import json
 import uuid
 import hashlib
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,11 +28,16 @@ APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ'
 PRIVACY_URL = 'https://telegra.ph/Politika-konfidencialnosti-EchoVPN-11-07'
 OFFER_URL = 'https://telegra.ph/Polzovatelskoe-soglashenie-EchoVPN-11-07'
 
-SUPABASE_URL = os.getenv('SUPABASE_URL')
+# ИСПРАВЛЕНО: Убираем слэш в конце (защита от PGRST125)
+SUPABASE_URL = (os.getenv('SUPABASE_URL') or '').rstrip('/')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
 
 AMYPAY_API_KEY = os.getenv('AMYPAY_API_KEY', '')
 AMYPAY_SECRET_WORD_2 = os.getenv('AMYPAY_SECRET_WORD_2', '')
+
+# ИСПРАВЛЕНО: Переменная для Stage-версии
+IS_TEST_MODE = os.getenv('IS_TEST_MODE', 'false').lower() == 'true'
+PUBLIC_URL = os.getenv('RENDER_EXTERNAL_URL', 'http://localhost:8080').rstrip('/')
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -57,10 +63,13 @@ user_temp_data = {}
 admin_reply_map = {}
 user_last_message_time = {}
 
-async def get_user_id_from_token(request):
+# --- ХЕЛПЕРЫ ---
+
+async def get_user_from_token(request):
+    """Возвращает (user_id, email) из JWT."""
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
-        return None
+        return None, None
     token = auth_header.split(' ')[1]
     
     headers_sb = {
@@ -73,20 +82,15 @@ async def get_user_id_from_token(request):
             async with session.get(f"{SUPABASE_URL}/auth/v1/user", headers=headers_sb, timeout=5) as resp:
                 if resp.status == 200:
                     user_data = await resp.json()
-                    return user_data.get('id')
+                    return user_data.get('id'), user_data.get('email')
                 else:
-                    # ДОБАВЛЕНО: Выводим ошибку от Supabase в логи Render
-                    error_text = await resp.text()
-                    logging.error(f"Ошибка проверки JWT: {resp.status} - {error_text}")
+                    logging.error(f"Ошибка проверки JWT: {resp.status} - {await resp.text()}")
     except Exception as e:
         logging.error(f"Ошибка валидации JWT: {e}")
-    return None
+    return None, None
 
 async def get_plan_from_db(plan_id):
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     try:
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/plans?id=eq.{plan_id}&is_active=eq.true&select=*", headers=headers_sb, timeout=5) as resp:
@@ -98,7 +102,7 @@ async def get_plan_from_db(plan_id):
     return None
 
 async def check_amypay_token():
-    if not AMYPAY_API_KEY: return
+    if not AMYPAY_API_KEY or IS_TEST_MODE: return
     url = "https://amypay.ru/api/v2/ping"
     headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}"}
     try:
@@ -111,19 +115,18 @@ async def check_amypay_token():
     except Exception as e:
         logging.error(f"Ошибка проверки ключа Amypay: {e}")
 
-# --- ФУНКЦИЯ ОТПРАВКИ ПУШЕЙ ---
-def send_push_notification(fcm_token, title, body):
+# ИСПРАВЛЕНО: Асинхронная отправка пушей (не блокирует event loop)
+async def send_push_notification(fcm_token, title, body):
     if not fcm_token: return
     try:
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             token=fcm_token,
         )
-        messaging.send(message)
+        await asyncio.to_thread(messaging.send, message)
         logging.info(f"Пуш успешно отправлен на токен {fcm_token[:10]}...")
     except Exception as e:
         logging.error(f"Ошибка отправки пуша: {e}")
-# ------------------------------
 
 def get_user_menu():
     keyboard = [
@@ -133,6 +136,8 @@ def get_user_menu():
         [InlineKeyboardButton(text="💬 Помощь", callback_data="help_mode")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# --- ОБРАБОТЧИКИ БОТА ---
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -190,11 +195,7 @@ async def confirm_email_yes(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Ошибка сессии. Начните заново.", reply_markup=get_user_menu())
         return
 
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
-    
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
             data = await resp.json()
@@ -207,11 +208,7 @@ async def confirm_email_yes(callback: CallbackQuery, state: FSMContext):
     await show_plans(callback.message)
 
 async def show_plans(message: Message):
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
-    
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/plans?is_active=eq.true&order=duration_days.asc", headers=headers_sb) as resp:
             plans = await resp.json()
@@ -228,10 +225,7 @@ async def show_plans(message: Message):
         )])
     
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
-    await message.answer(
-        "💳 <b>Выберите тариф для покупки:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
+    await message.answer("💳 <b>Выберите тариф для покупки:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 @router.callback_query(F.data.startswith("pay_"))
 async def process_payment(callback: CallbackQuery):
@@ -250,40 +244,29 @@ async def process_payment(callback: CallbackQuery):
     days = plan['duration_days']
     amount = plan['price_rub']
     is_family = 'Семейная' in plan['name']
-
-    api_url = "https://amypay.ru/api/v2/orders"
-    headers = {
-        "Authorization": f"Bearer {AMYPAY_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}|sub"
     
-    payload = {
-        "amount": int(amount),
-        "external_order_id": order_id,
-        "description": f"EchoVPN Subscription ({days} days)"
-    }
-    
-    async with ClientSession() as session:
-        async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
-            resp_data = await resp.json()
-            
-            if resp.status in [200, 201] and resp_data.get('ok'):
-                pay_url = resp_data.get('order', {}).get('pay_url')
-                if pay_url:
-                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
-                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
-                    ])
-                    await callback.message.edit_text(
-                        f"✅ Заказ на <b>{days} дней</b> (Сумма: {amount} ₽) создан!\n\n"
-                        f"Нажмите кнопку ниже, чтобы оплатить.",
-                        reply_markup=keyboard
-                    )
-                    return
-    
-    await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
+    pay_url = ""
+    if IS_TEST_MODE:
+        pay_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={amount}"
+    else:
+        api_url = "https://amypay.ru/api/v2/orders"
+        headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
+        payload = {"amount": int(amount), "external_order_id": order_id, "description": f"EchoVPN Subscription ({days} days)"}
+        async with ClientSession() as session:
+            async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
+                resp_data = await resp.json()
+                if resp.status in [200, 201] and resp_data.get('ok'):
+                    pay_url = resp_data.get('order', {}).get('pay_url')
+
+    if pay_url:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
+        ])
+        await callback.message.edit_text(f"✅ Заказ на <b>{days} дней</b> (Сумма: {amount} ₽) создан!\n\nНажмите кнопку ниже, чтобы оплатить.", reply_markup=keyboard)
+    else:
+        await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
 
 @router.callback_query(F.data == "check_status")
 async def ask_email_status(callback: CallbackQuery, state: FSMContext):
@@ -298,11 +281,7 @@ async def process_email_status(message: Message, state: FSMContext):
     email = message.text.strip().lower()
     await state.clear()
     
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
-    
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=subscription_plan,subscription_expires_at,family_owner_id", headers=headers_sb) as resp:
             data = await resp.json()
@@ -336,10 +315,7 @@ async def process_email_status(message: Message, state: FSMContext):
             )
             return
             
-    await message.answer(
-        "❌ <b>Подписка не активна.</b>\n\nВы можете приобрести её в главном меню.",
-        reply_markup=get_user_menu()
-    )
+    await message.answer("❌ <b>Подписка не активна.</b>\n\nВы можете приобрести её в главном меню.", reply_markup=get_user_menu())
 
 @router.callback_query(F.data == "help_mode")
 async def help_mode(callback: CallbackQuery, state: FSMContext):
@@ -364,13 +340,7 @@ async def cmd_give_days(message: Message):
         await message.answer("⚠️ Количество дней должно быть числом.")
         return
 
-    await message.answer(f"⏳ Ищу пользователя {email} и начисляю {days} дней...")
-
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
-
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
             data = await resp.json()
@@ -400,9 +370,7 @@ async def cmd_reset_device(message: Message):
                 return
             user_id = data[0]['id']
 
-        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", 
-                                 json={"active_devices": []}, 
-                                 headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
+        async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"active_devices": []}, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
             pass
 
     await message.answer(f"✅ Все устройства для {email} успешно отвязаны.")
@@ -410,11 +378,9 @@ async def cmd_reset_device(message: Message):
 @router.message(F.chat.id != ADMIN_ID)
 async def forward_to_admin(message: Message, state: FSMContext):
     current_state = await state.get_state()
-    if current_state is not None:
-        return
+    if current_state is not None: return
 
     user = message.from_user
-    
     now = time.time()
     last_time = user_last_message_time.get(user.id, 0)
     if now - last_time < 30:
@@ -423,23 +389,18 @@ async def forward_to_admin(message: Message, state: FSMContext):
     user_last_message_time[user.id] = now
 
     safe_name = html.escape(user.full_name)
-    
     admin_text_header = (
         f"<b>📩 Новое сообщение в поддержку</b>\n\n"
         f"👤 От: {safe_name}\n"
         f"🆔 ID: <code>{user.id}</code>\n"
         f"🔗 Username: @{user.username or 'нет'}\n\n"
     )
-    
-    close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Закрыть обращение", callback_data=f"close_admin_{user.id}")]
-    ])
+    close_keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Закрыть обращение", callback_data=f"close_admin_{user.id}")]])
     
     try:
         sent_msg = None
         if message.text:
-            text = html.escape(message.text)
-            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + f"💬 Текст:\n{text}", reply_markup=close_keyboard)
+            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + f"💬 Текст:\n{html.escape(message.text)}", reply_markup=close_keyboard)
         elif message.photo:
             caption = html.escape(message.caption) if message.caption else "Без подписи"
             sent_msg = await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=admin_text_header + f"🖼 Фото:\n{caption}", reply_markup=close_keyboard)
@@ -448,12 +409,8 @@ async def forward_to_admin(message: Message, state: FSMContext):
             sent_msg = await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=admin_text_header + f"📄 Документ:\n{caption}", reply_markup=close_keyboard)
         elif message.video:
             sent_msg = await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=admin_text_header + "🎥 Видео", reply_markup=close_keyboard)
-        else:
-            sent_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text_header + "❓ Неизвестный тип сообщения", reply_markup=close_keyboard)
-
-        if sent_msg:
-            admin_reply_map[sent_msg.message_id] = user.id
-            
+        
+        if sent_msg: admin_reply_map[sent_msg.message_id] = user.id
         await message.answer("✅ Ваше сообщение передано в поддержку. Ожидайте ответа.")
     except Exception as e:
         logging.error(f"Ошибка отправки админу: {e}")
@@ -465,207 +422,136 @@ async def reply_to_user(message: Message):
     target_user_id = admin_reply_map.get(reply_to_msg_id)
 
     if not target_user_id:
-        await message.answer("❌ Не могу определить, кому отправить этот ответ (возможно, обращение уже закрыто).")
+        await message.answer("❌ Не могу определить, кому отправить этот ответ.")
         return
 
-    user_close_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Обращение закрыто", callback_data=f"close_user_{target_user_id}")]
-    ])
+    user_close_keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Обращение закрыто", callback_data=f"close_user_{target_user_id}")]])
 
     try:
         if message.text:
-            safe_reply = html.escape(message.text)
-            await bot.send_message(
-                chat_id=target_user_id, 
-                text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{safe_reply}", 
-                reply_markup=user_close_keyboard
-            )
+            await bot.send_message(chat_id=target_user_id, text=f"<b>📬 Ответ поддержки EchoVPN:</b>\n\n{html.escape(message.text)}", reply_markup=user_close_keyboard)
             await message.answer("✅ Ответ отправлен пользователю.")
-        else:
-            await message.answer("⚠️ Пожалуйста, отвечайте текстом.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке ответа: {e}")
 
 @router.callback_query(F.data.startswith("close_admin_"))
 async def close_ticket_admin(callback: CallbackQuery):
     target_user_id = int(callback.data.split("_")[2])
-    
     for msg_id, u_id in list(admin_reply_map.items()):
-        if u_id == target_user_id:
-            del admin_reply_map[msg_id]
-
+        if u_id == target_user_id: del admin_reply_map[msg_id]
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Обращение закрыто.")
-    
-    try:
-        await bot.send_message(
-            chat_id=target_user_id, 
-            text="🔒 <b>Ваше обращение в поддержку было закрыто.</b>\n\nЕсли у вас остались вопросы, вы можете создать новое обращение в главном меню."
-        )
-    except Exception:
-        pass
+    try: await bot.send_message(chat_id=target_user_id, text="🔒 <b>Ваше обращение в поддержку было закрыто.</b>")
+    except: pass
 
 @router.callback_query(F.data.startswith("close_user_"))
 async def close_ticket_user(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Спасибо! Обращение закрыто.")
-    
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=f"✅ Пользователь @{callback.from_user.username or callback.from_user.id} закрыл обращение. (Поблагодарил)."
-        )
-    except Exception:
-        pass
+    try: await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Пользователь @{callback.from_user.username or callback.from_user.id} закрыл обращение.")
+    except: pass
+
+
+# --- БИЗНЕС-ЛОГИКА И API ---
 
 async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
     logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan})")
-    
-    headers_sb = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-    }
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
     
     async with ClientSession() as session:
         async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code,fcm_token", headers=headers_sb) as resp:
             profile_data = await resp.json()
-            if not profile_data:
-                logging.error(f"Профиль {user_id} не найден.")
-                return
+            if not profile_data: return
             
-            user_email = profile_data[0].get('email', 'user')
-            current_expires_str = profile_data[0].get('subscription_expires_at')
-            referred_by = profile_data[0].get('referred_by')
-            bonus_paid = profile_data[0].get('referral_bonus_paid', False)
-            current_family_code = profile_data[0].get('family_code')
-            user_fcm_token = profile_data[0].get('fcm_token')
+            p = profile_data[0]
+            current_expires_str = p.get('subscription_expires_at')
+            referred_by = p.get('referred_by')
+            bonus_paid = p.get('referral_bonus_paid', False)
+            current_family_code = p.get('family_code')
+            user_fcm_token = p.get('fcm_token')
         
         client_name = f"u_{user_id[:8]}"
-
         now = datetime.now(timezone.utc)
         
         if family_owner_expires:
             new_expires = family_owner_expires
         else:
-            if current_expires_str:
-                current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
-                base_date = current_expires if current_expires > now else now
-            else:
-                base_date = now
-            new_expires = base_date + timedelta(days=days)
+            base_date = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00')) if current_expires_str else now
+            new_expires = (base_date if base_date > now else now) + timedelta(days=days)
         
         new_expires_iso = new_expires.isoformat()
         total_days_for_panel = max(1, (new_expires - now).days)
+        client_uuid = str(uuid.uuid4())
 
         async with session.get(f"{SUPABASE_URL}/rest/v1/servers?select=*", headers=headers_sb) as resp:
             servers = await resp.json()
 
         generated_urls = {}
-        client_uuid = str(uuid.uuid4())
 
         async def create_on_server(server):
-            api_url = server['api_url']
-            api_token = server['api_token']
-            inbound_id = server['inbound_id']
-            base_url = api_url.replace('/create', '')
+            headers_xui = {"Content-Type": "application/json", "Authorization": f"Bearer {server['api_token']}", "X-API-Key": server['api_token']}
+            base_url = server['api_url'].replace('/create', '')
             
-            headers_xui = {"Content-Type": "application/json", "Authorization": f"Bearer {api_token}", "X-API-Key": api_token}
-
             try:
                 encoded_name = quote(client_name, safe='')
                 async with session.delete(f"{base_url}/clients/{encoded_name}", headers=headers_xui, timeout=5): pass 
-            except Exception: pass
+            except: pass
 
-            payload = {"name": client_name, "uuid": client_uuid, "days": total_days_for_panel, "inbound_ids": [inbound_id]}
-
+            payload = {"name": client_name, "uuid": client_uuid, "days": total_days_for_panel, "inbound_ids": [server['inbound_id']]}
             try:
-                async with session.post(api_url, json=payload, headers=headers_xui, timeout=5) as resp:
+                async with session.post(server['api_url'], json=payload, headers=headers_xui, timeout=5) as resp:
                     if resp.status in [200, 201]:
-                        domain = server['domain']
-                        pbk = server['pbk']
-                        sid = server['sid']
-                        
-                        if server.get('country_code') == 'ES':
-                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none#EchoVPN-{server['name']}"
-                        else:
-                            vless_url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none&flow=xtls-rprx-vision#EchoVPN-{server['name']}"
-                        
-                        vless_url = vless_url.replace(' ', '').replace('\n', '').replace('\r', '')
-                        return server['id'], vless_url
-            except Exception: pass
+                        domain, pbk, sid = server['domain'], server['pbk'], server['sid']
+                        flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') != 'ES' else ""
+                        url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none{flow_str}#EchoVPN-{server['name']}"
+                        return server['id'], url.replace(' ', '').replace('\n', '')
+            except: pass
             return None
 
-        tasks = [create_on_server(s) for s in servers]
-        results = await asyncio.gather(*tasks)
-
-        for result in results:
-            if result:
-                server_id, url = result
-                generated_urls[server_id] = url
+        results = await asyncio.gather(*[create_on_server(s) for s in servers])
+        for res in results:
+            if res: generated_urls[res[0]] = res[1]
 
         if generated_urls:
             update_data = {"vless_urls": generated_urls, "subscription_plan": "premium", "subscription_expires_at": new_expires_iso}
             
             if is_family_plan and not current_family_code:
-                new_family_code = hashlib.md5(f"{user_id}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
-                update_data["family_code"] = new_family_code
-                logging.info(f"Сгенерирован семейный код {new_family_code} для {user_id}")
+                update_data["family_code"] = hashlib.md5(f"{user_id}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
 
             if not is_bonus and referred_by and not bonus_paid:
-                logging.info(f"Пользователь {user_id} оплатил. Начисляем бонус {referred_by}.")
                 update_data["referral_bonus_paid"] = True
                 asyncio.create_task(process_successful_payment(referred_by, 7, is_bonus=True))
 
-            headers_patch = {**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers=headers_patch) as resp:
-                if resp.status not in [200, 204]:
-                    logging.error(f"Ошибка Supabase: {await resp.text()}")
-                else:
-                    logging.info(f"Подписка для {user_id} обновлена.")
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"}) as r: pass
 
-            # Отправляем пуш об успешной активации, если это не бонус
             if not is_bonus and user_fcm_token:
-                send_push_notification(
-                    user_fcm_token, 
-                    "✅ Подписка активирована!", 
-                    f"Ваш VPN готов к использованию. Приятного серфинга!"
-                )
+                await send_push_notification(user_fcm_token, "✅ Подписка активирована!", "Ваш VPN готов к использованию. Приятного серфинга!")
 
             if is_family_plan or current_family_code:
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as resp:
                     members = await resp.json()
-                    for member in members:
-                        m_update = {"subscription_expires_at": new_expires_iso}
-                        await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member['id']}", json=m_update, headers=headers_patch)
-                        logging.info(f"Обновлена подписка члена семьи {member['id']}")
+                    for m in members:
+                        await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{m['id']}", json={"subscription_expires_at": new_expires_iso}, headers={**headers_sb, "Content-Type": "application/json"})
 
 async def handle_create_amypay_payment(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
 
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=family_owner_id", headers=headers_sb) as resp:
-                user_profile = await resp.json()
-                if user_profile and user_profile[0].get('family_owner_id'):
-                    return web.Response(
-                        text=json.dumps({"error": "Вы состоите в семейной подписке. Выйдите из семьи, чтобы купить личную."}), 
-                        status=403, 
-                        content_type='application/json'
-                    )
+                if (await resp.json())[0].get('family_owner_id'):
+                    return web.Response(text=json.dumps({"error": "Вы состоите в семейной подписке. Выйдите из семьи, чтобы купить личную."}), status=403)
 
         data = await request.json()
         plan_id = data.get('planId') 
         promo_code = data.get('promoCode', '').strip().upper()
 
-        if not plan_id:
-            return web.Response(text=json.dumps({"error": "No planId"}), status=400, content_type='application/json')
+        if not plan_id: return web.Response(text=json.dumps({"error": "No planId"}), status=400)
 
         plan = await get_plan_from_db(plan_id)
-        if not plan:
-            return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400, content_type='application/json')
+        if not plan: return web.Response(text=json.dumps({"error": "Invalid plan"}), status=400)
 
         days = plan['duration_days']
         amount = float(plan['price_rub'])
@@ -676,52 +562,43 @@ async def handle_create_amypay_payment(request):
                 async with session.get(f"{SUPABASE_URL}/rest/v1/promocodes?code=eq.{promo_code}&is_active=eq.true", headers=headers_sb) as resp:
                     promo_data = await resp.json()
                     if promo_data:
-                        discount = promo_data[0]['discount_percent']
-                        amount = amount - (amount * discount / 100)
-                        logging.info(f"Применен промокод {promo_code}. Скидка {discount}%. Новая цена: {amount}")
+                        amount = amount - (amount * promo_data[0]['discount_percent'] / 100)
 
         order_id = f"{real_user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}|sub"
         
+        # ИСПРАВЛЕНО: Проверка на тестовый режим (Stage)
+        if IS_TEST_MODE:
+            fake_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={int(amount)}"
+            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200)
+
         api_url = "https://amypay.ru/api/v2/orders"
-        headers = {
-            "Authorization": f"Bearer {AMYPAY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "amount": int(amount),
-            "external_order_id": order_id,
-            "description": f"EchoVPN Subscription ({days} days)"
-        }
+        headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
+        payload = {"amount": int(amount), "external_order_id": order_id, "description": f"EchoVPN Subscription ({days} days)"}
         
         async with ClientSession() as session:
             async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
                 resp_data = await resp.json()
-                
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    pay_url = resp_data.get('order', {}).get('pay_url')
-                    if pay_url:
-                        return web.Response(
-                            text=json.dumps({"payment_url": pay_url}),
-                            status=200,
-                            content_type='application/json'
-                        )
-                
-                return web.Response(text=json.dumps({"error": "Failed to create order"}), status=500, content_type='application/json')
+                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200)
+                return web.Response(text=json.dumps({"error": "Failed to create order"}), status=500)
                 
     except Exception as e:
         logging.error(f"Error create payment: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_buy_device_slot(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(status=401)
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
             
         amount = 99 
         order_id = f"{real_user_id}|0|{int(datetime.now().timestamp())}|0|false|device" 
         
+        # ИСПРАВЛЕНО: Проверка на тестовый режим (Stage)
+        if IS_TEST_MODE:
+            fake_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={amount}"
+            return web.Response(text=json.dumps({"payment_url": fake_url}), status=200)
+
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
         payload = {"amount": amount, "external_order_id": order_id, "description": "EchoVPN Extra Device Slot"}
@@ -730,18 +607,62 @@ async def handle_buy_device_slot(request):
             async with session.post(api_url, json=payload, headers=headers, timeout=10) as resp:
                 resp_data = await resp.json()
                 if resp.status in [200, 201] and resp_data.get('ok'):
-                    pay_url = resp_data.get('order', {}).get('pay_url')
-                    if pay_url:
-                        return web.Response(text=json.dumps({"payment_url": pay_url}), status=200, content_type='application/json')
-        return web.Response(text="Error", status=500)
+                    return web.Response(text=json.dumps({"payment_url": resp_data.get('order', {}).get('pay_url')}), status=200)
+        return web.Response(text=json.dumps({"error": "Failed"}), status=500)
     except Exception as e:
-        return web.Response(text=str(e), status=500)
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
+async def handle_fake_pay(request):
+    """Фейковая страница оплаты для Stage"""
+    order_id = request.query.get('order_id', '')
+    amount = request.query.get('amount', '0')
+    
+    # Считаем правильную подпись, чтобы фейковый вебхук прошел проверку безопасности
+    sig = hashlib.sha256(f"{order_id}:paid:{amount}:{AMYPAY_SECRET_WORD_2}".encode()).hexdigest()
+    
+    page = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>EchoVPN Test Pay</title></head>
+    <body style="background:#0F172A;color:white;font-family:sans-serif;text-align:center;padding:60px 20px">
+      <h1>🧪 ТЕСТОВАЯ ОПЛАТА (STAGE)</h1>
+      <p style="color:#94a3b8">Это симуляция успешной оплаты. В продакшене будет Amypay.</p>
+      <p>Order ID: <code style="background:#1E293B;padding:4px 8px;border-radius:4px">{order_id}</code></p>
+      <p>Сумма: <b>{amount} ₽</b></p>
+      <form method="POST" action="/api/amypay/webhook" style="margin-top:40px">
+        <input type="hidden" name="external_order_id" value="{order_id}">
+        <input type="hidden" name="number" value="{order_id}">
+        <input type="hidden" name="status" value="paid">
+        <input type="hidden" name="amount" value="{amount}">
+        <input type="hidden" name="signature" value="{sig}">
+        <button type="submit" style="padding:20px 40px;font-size:18px;background:#06B6D4;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:bold">
+          ✅ Симулировать успешную оплату
+        </button>
+      </form></body></html>"""
+    return web.Response(text=page, content_type='text/html')
+
+# ИСПРАВЛЕНО: Проверка статуса, проверка подписи, идемпотентность
 async def handle_amypay_webhook(request):
     try:
-        data = await request.post()
-        external_order_id = data.get('external_order_id')
+        # Amypay может присылать как form-data, так и JSON
+        if request.content_type == 'application/x-www-form-urlencoded':
+            data = await request.post()
+        else:
+            data = await request.json()
+            
+        status = data.get('status')
+        if status and status != 'paid':
+            return web.Response(text="OK", status=200) # Игнорируем pending/canceled/failed
+
+        number = data.get('number')
+        amount = data.get('amount')
+        signature = data.get('signature')
         
+        # Проверка подписи (защита от подделки)
+        if AMYPAY_SECRET_WORD_2 and signature:
+            expected_sig = hashlib.sha256(f"{number}:{status}:{amount}:{AMYPAY_SECRET_WORD_2}".encode()).hexdigest()
+            if signature != expected_sig:
+                logging.warning(f"Webhook: Неверная подпись! Data: {data}")
+                return web.Response(text="Bad signature", status=403)
+        
+        external_order_id = data.get('external_order_id')
         if external_order_id:
             parts = external_order_id.split('|')
             if len(parts) >= 2:
@@ -751,10 +672,24 @@ async def handle_amypay_webhook(request):
                 is_family = parts[4].lower() == 'true' if len(parts) > 4 else False
                 action_type = parts[5] if len(parts) > 5 else "sub"
                 
+                # Идемпотентность: проверяем, не обрабатывали ли мы уже этот заказ
+                headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Prefer": "return=representation,resolution=ignore-duplicates"}
+                async with ClientSession() as session:
+                    async with session.post(f"{SUPABASE_URL}/rest/v1/payments", json={
+                        "external_order_id": external_order_id, 
+                        "user_id": target_id if not target_id.startswith("waiting_") else None,
+                        "amount_rub": int(float(amount)), 
+                        "days": days, 
+                        "action_type": action_type, 
+                        "status": "paid"
+                    }, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
+                        inserted_rows = await resp.json()
+                        if not inserted_rows:
+                            logging.info(f"Webhook: Заказ {external_order_id} уже обработан. Пропускаем.")
+                            return web.Response(text="OK", status=200)
+
                 asyncio.create_task(process_webhook_background(target_id, days, chat_id, is_family, action_type))
-                    
                 return web.Response(text="OK", status=200)
-        
         return web.Response(text="OK", status=200)
 
     except Exception as e:
@@ -765,371 +700,259 @@ async def process_webhook_background(target_id, days, chat_id, is_family, action
     try:
         if target_id.startswith("waiting_"):
             email = target_id.replace("waiting_", "")
-            logging.info(f"Отложенная оплата для {email} на {days} дней.")
-            
-            headers_sb = {
-                "apikey": SUPABASE_SERVICE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal"
-            }
-            
+            headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"}
             async with ClientSession() as session:
-                payload = {"email": email, "days": days}
-                await session.post(f"{SUPABASE_URL}/rest/v1/pending_payments", json=payload, headers=headers_sb)
-                
-            if chat_id:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="✅ <b>Оплата получена!</b>\n\n"
-                         "Мы сохранили вашу подписку. Она начислится автоматически, как только вы зарегистрируетесь в приложении с этим email."
-                )
+                await session.post(f"{SUPABASE_URL}/rest/v1/pending_payments", json={"email": email, "days": days}, headers=headers_sb)
+            if chat_id: await bot.send_message(chat_id=chat_id, text="✅ <b>Оплата получена!</b>\n\nНачислим при регистрации.")
         else:
             if action_type == "device":
                 headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
                 async with ClientSession() as session:
                     async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}&select=max_devices_allowed,fcm_token", headers=headers_sb) as resp:
-                        p = await resp.json()
-                        current_max = p[0].get('max_devices_allowed', 2) if p else 2
-                        user_fcm_token = p[0].get('fcm_token') if p else None
-                    
-                    new_max = min(current_max + 1, 5)
-                    await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}", 
-                                        json={"max_devices_allowed": new_max}, headers={**headers_sb, "Content-Type": "application/json"})
-                
-                if user_fcm_token:
-                    send_push_notification(user_fcm_token, "✅ Слот добавлен!", "Теперь вы можете войти еще на одном устройстве.")
-                
-                if chat_id:
-                    await bot.send_message(chat_id=chat_id, text="✅ <b>Слот устройства добавлен!</b>\n\nТеперь вы можете войти еще на одном устройстве.")
+                        p = (await resp.json())[0]
+                    new_max = min(p.get('max_devices_allowed', 2) + 1, 5)
+                    await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{target_id}", json={"max_devices_allowed": new_max}, headers={**headers_sb, "Content-Type": "application/json"})
+                if p.get('fcm_token'): await send_push_notification(p['fcm_token'], "✅ Слот добавлен!", "Теперь вы можете войти еще на одном устройстве.")
+                if chat_id: await bot.send_message(chat_id=chat_id, text="✅ <b>Слот устройства добавлен!</b>")
             else:
                 await process_successful_payment(target_id, days, is_family_plan=is_family)
-                
-                if chat_id:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="✅ <b>Оплата успешно получена!</b>\n\n"
-                             "Ваша подписка активирована. Откройте приложение EchoVPN, обновите экран подписки, и вы увидите новые дни."
-                    )
+                if chat_id: await bot.send_message(chat_id=chat_id, text="✅ <b>Оплата успешно получена!</b>\n\nПодписка активирована.")
     except Exception as e:
         logging.error(f"Ошибка фоновой обработки вебхука: {e}")
 
+# ИСПРАВЛЕНО: Берем email из JWT, а не из тела запроса (защита от кражи платежей)
 async def handle_check_pending(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text="Unauthorized", status=401)
-
-        data = await request.json()
-        email = data.get('email')
-        
-        if not email:
-            return web.Response(text="Bad Request", status=400)
+        real_user_id, user_email = await get_user_from_token(request)
+        if not real_user_id or not user_email: return web.Response(text="Unauthorized", status=401)
             
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
-        
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/pending_payments?email=eq.{email}&select=id,days", headers=headers_sb) as resp:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/pending_payments?email=eq.{user_email}&select=id,days", headers=headers_sb) as resp:
                 pending = await resp.json()
                 
-            if not pending:
-                return web.Response(text="No pending payments", status=404)
+            if not pending: return web.Response(text="No pending payments", status=404)
                 
             for p in pending:
                 async with session.delete(f"{SUPABASE_URL}/rest/v1/pending_payments?id=eq.{p['id']}", headers=headers_sb) as del_resp:
                     if del_resp.status == 204:
                         await process_successful_payment(real_user_id, p['days'])
-                    
             return web.Response(text="OK", status=200)
-            
     except Exception as e:
         logging.error(f"Ошибка проверки отложенных платежей: {e}")
         return web.Response(text="Error", status=500)
 
 async def handle_check_device(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
             
         data = await request.json()
         device_id = data.get('deviceId')
         device_name = data.get('deviceName', 'Устройство') 
-        
-        if not device_id:
-            return web.Response(text=json.dumps({"error": "No deviceId"}), status=400, content_type='application/json')
+        if not device_id: return web.Response(text=json.dumps({"error": "No deviceId"}), status=400)
 
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
-        
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=active_devices,max_devices_allowed", headers=headers_sb) as resp:
                 profile = await resp.json()
                 
-            if not profile: 
-                return web.Response(text=json.dumps({"error": "Profile not found"}), status=404, content_type='application/json')
+            if not profile: return web.Response(text=json.dumps({"error": "Profile not found"}), status=404)
             
             active_devices = profile[0].get('active_devices') or []
             max_allowed = profile[0].get('max_devices_allowed') or 2
             
-            device_exists = any(d.get('id') == device_id for d in active_devices)
-            
-            if not device_exists:
+            if not any(d.get('id') == device_id for d in active_devices):
                 if len(active_devices) >= max_allowed:
-                    return web.Response(text=json.dumps({"error": "Device limit reached"}), status=403, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Device limit reached"}), status=403)
                 
                 active_devices.append({"id": device_id, "name": device_name})
-                
-                async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
-                                    json={"active_devices": active_devices}, 
-                                    headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as patch_resp:
-                    pass
-                
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+                async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"active_devices": active_devices}, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as patch_resp: pass
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
         logging.error(f"Error check device: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_trial(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401, content_type='application/json')
+        real_user_id, user_email = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text=json.dumps({"error": "Unauthorized"}), status=401)
 
         data = await request.json()
         device_id = data.get('deviceId', '')
-        
-        if not device_id:
-             return web.Response(text=json.dumps({"error": "Device ID required"}), status=400, content_type='application/json')
+        if not device_id: return web.Response(text=json.dumps({"error": "Device ID required"}), status=400)
 
         client_ip = request.headers.get('X-Real-IP', 'unknown')
         if client_ip == 'unknown':
             forwarded = request.headers.get('X-Forwarded-For')
-            if forwarded:
-                client_ip = forwarded.split(',')[0].strip()
+            if forwarded: client_ip = forwarded.split(',')[0].strip()
 
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
 
         async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=has_used_trial,email", headers=headers_sb) as resp:
-                profile = await resp.json()
-                if not profile:
-                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
-                if profile[0].get('has_used_trial'):
-                    return web.Response(text=json.dumps({"error": "Trial already used"}), status=403, content_type='application/json')
-                user_email = profile[0].get('email', '')
+            # Проверка has_used_trial в профиле
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=has_used_trial", headers=headers_sb) as resp:
+                if (await resp.json())[0].get('has_used_trial'):
+                    return web.Response(text=json.dumps({"error": "Trial already used"}), status=403)
 
-            async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?device_id=eq.{device_id}&select=id", headers=headers_sb) as resp:
-                device_logs = await resp.json()
-                if device_logs:
-                    async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
-                                             json={"has_used_trial": True}, 
-                                             headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as r:
-                        pass
-                    return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403, content_type='application/json')
+            # Проверка по device_id
+            async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?device_id=eq.{device_id}", headers=headers_sb) as resp:
+                if await resp.json():
+                    return web.Response(text=json.dumps({"error": "Trial already used on this device"}), status=403)
+            
+            # ИСПРАВЛЕНО: Проверка по email
+            async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?email=eq.{user_email}", headers=headers_sb) as resp:
+                if await resp.json():
+                    return web.Response(text=json.dumps({"error": "Trial already used with this email"}), status=403)
 
+            # Проверка по IP
             if client_ip != 'unknown':
-                async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?ip_address=eq.{client_ip}&select=id", headers=headers_sb) as resp:
-                    ip_logs = await resp.json()
-                    if len(ip_logs) >= 3:
-                        return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403, content_type='application/json')
+                async with session.get(f"{SUPABASE_URL}/rest/v1/trials_log?ip_address=eq.{client_ip}", headers=headers_sb) as resp:
+                    if len(await resp.json()) >= 3:
+                        return web.Response(text=json.dumps({"error": "Too many trials from this IP"}), status=403)
 
             await process_successful_payment(real_user_id, 7)
 
             log_data = {"user_id": real_user_id, "device_id": device_id, "ip_address": client_ip, "email": user_email}
-            async with session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
+            await session.post(f"{SUPABASE_URL}/rest/v1/trials_log", json=log_data, headers={**headers_sb, "Content-Type": "application/json"})
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"has_used_trial": True}, headers={**headers_sb, "Content-Type": "application/json"})
 
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"has_used_trial": True}, headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
-
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
         logging.error(f"Ошибка активации триала: {e}")
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_apply_referral(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text="Unauthorized", status=401)
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text="Unauthorized", status=401)
 
         data = await request.json()
         referral_code = data.get('referralCode', '').strip().lower()
-        
-        if not referral_code:
-            return web.Response(text="Bad Request", status=400)
+        if not re.fullmatch(r'[a-f0-9]{8}', referral_code):
+            return web.Response(text=json.dumps({"error": "Invalid code format"}), status=400)
             
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=referred_by", headers=headers_sb) as resp:
-                user_data = await resp.json()
-                if user_data and user_data[0].get('referred_by'):
-                    return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400, content_type='application/json')
+                if (await resp.json())[0].get('referred_by'):
+                    return web.Response(text=json.dumps({"error": "Referral already applied"}), status=400)
                     
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?referral_code=eq.{referral_code}&select=id", headers=headers_sb) as resp:
                 referrer_data = await resp.json()
                 if not referrer_data:
-                    return web.Response(text=json.dumps({"error": "Invalid referral code"}), status=404, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Invalid referral code"}), status=404)
                 
                 referrer_id = referrer_data[0]['id']
-                
                 if referrer_id == real_user_id:
-                    return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Cannot refer yourself"}), status=400)
 
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
-                                     json={"referred_by": referrer_id}, 
-                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"referred_by": referrer_id}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_join_family(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text="Unauthorized", status=401)
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text="Unauthorized", status=401)
 
         data = await request.json()
         family_code = data.get('familyCode', '').strip().lower()
-        
-        if not family_code:
-            return web.Response(text="Bad Request", status=400)
+        if not family_code: return web.Response(text="Bad Request", status=400)
             
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=family_owner_id", headers=headers_sb) as resp:
-                user_data = await resp.json()
-                if user_data and user_data[0].get('family_owner_id'):
-                    return web.Response(text=json.dumps({"error": "Already in a family"}), status=400, content_type='application/json')
+                if (await resp.json())[0].get('family_owner_id'):
+                    return web.Response(text=json.dumps({"error": "Already in a family"}), status=400)
                     
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_code=eq.{family_code}&select=id,subscription_expires_at", headers=headers_sb) as resp:
                 owner_data = await resp.json()
                 if not owner_data:
-                    return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Invalid family code"}), status=404)
                 
                 owner_id = owner_data[0]['id']
                 owner_expires_str = owner_data[0].get('subscription_expires_at')
                 
                 if owner_id == real_user_id:
-                    return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400, content_type='application/json')
-
+                    return web.Response(text=json.dumps({"error": "Cannot join your own family"}), status=400)
                 if not owner_expires_str:
-                     return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400, content_type='application/json')
+                     return web.Response(text=json.dumps({"error": "Owner has no active subscription"}), status=400)
 
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{owner_id}&select=id", headers=headers_sb) as resp:
                 members = await resp.json()
                 if len(members) >= 2:
-                    return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Family is full (max 3 accounts)"}), status=400)
 
                 now = datetime.now(timezone.utc)
                 owner_expires = datetime.fromisoformat(owner_expires_str.replace('Z', '+00:00'))
                 days_left = (owner_expires - now).days
                 
                 if days_left <= 0:
-                    return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Owner subscription expired"}), status=400)
 
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
-                                     json={"family_owner_id": owner_id}, 
-                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
-            
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"family_owner_id": owner_id}, headers={**headers_sb, "Content-Type": "application/json"})
             await process_successful_payment(real_user_id, days_left, is_bonus=True, family_owner_expires=owner_expires)
                 
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_remove_family_member(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text="Unauthorized", status=401)
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text="Unauthorized", status=401)
 
         data = await request.json()
         member_id = data.get('memberId')
-        
-        if not member_id:
-            return web.Response(text="Bad Request", status=400)
+        if not member_id: return web.Response(text="Bad Request", status=400)
             
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}&select=family_owner_id", headers=headers_sb) as resp:
-                data = await resp.json()
-                if not data or data[0].get('family_owner_id') != real_user_id:
-                    return web.Response(text=json.dumps({"error": "User is not in your family"}), status=400, content_type='application/json')
+                m_data = await resp.json()
+                if not m_data or m_data[0].get('family_owner_id') != real_user_id:
+                    return web.Response(text=json.dumps({"error": "User is not in your family"}), status=400)
 
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}", 
-                                     json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None}, 
-                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{member_id}", json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None, "subscription_expires_at": None}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_leave_family(request):
     try:
-        real_user_id = await get_user_id_from_token(request)
-        if not real_user_id:
-            return web.Response(text="Unauthorized", status=401)
+        real_user_id, _ = await get_user_from_token(request)
+        if not real_user_id: return web.Response(text="Unauthorized", status=401)
 
-        headers_sb = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
-        }
-        
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
-            async with session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", 
-                                     json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None}, 
-                                     headers={**headers_sb, "Content-Type": "application/json", "Prefer": "return=minimal"}) as resp:
-                pass
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}", json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None, "subscription_expires_at": None}, headers={**headers_sb, "Content-Type": "application/json"})
                 
-        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+        return web.Response(text=json.dumps({"success": True}), status=200)
     except Exception as e:
-        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+        return web.Response(text=json.dumps({"error": str(e)}), status=500)
 
 async def handle_cron_expiring(request):
     try:
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
-        
         async with ClientSession() as session:
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/profiles?fcm_token=not.is.null&subscription_expires_at=not.is.null&select=email,fcm_token,subscription_expires_at", 
-                headers=headers_sb
-            ) as resp:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?fcm_token=not.is.null&subscription_expires_at=not.is.null&select=email,fcm_token,subscription_expires_at", headers=headers_sb) as resp:
                 profiles = await resp.json()
                 
         now = datetime.now(timezone.utc)
         count = 0
-        
         for profile in profiles:
             expires_at = datetime.fromisoformat(profile['subscription_expires_at'].replace('Z', '+00:00'))
             days_left = (expires_at - now).days
             
             if days_left in [3, 1]:
-                title = "⚠️ Подписка истекает!"
-                body = f"У вас осталось {days_left} дн. Продлите сейчас, чтобы не остаться без VPN."
-                send_push_notification(profile['fcm_token'], title, body)
+                await send_push_notification(profile['fcm_token'], "⚠️ Подписка истекает!", f"У вас осталось {days_left} дн. Продлите сейчас, чтобы не остаться без VPN.")
                 count += 1
                 
         return web.Response(text=f"Cron executed. Pushes sent: {count}", status=200)
@@ -1137,11 +960,15 @@ async def handle_cron_expiring(request):
         logging.error(f"Ошибка крона пушей: {e}")
         return web.Response(text=str(e), status=500)
 
+
+# --- ЗАПУСК ---
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
     app.router.add_post('/api/amypay/create-payment', handle_create_amypay_payment)
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
+    app.router.add_get('/api/fake-pay', handle_fake_pay)
     app.router.add_post('/api/check-pending', handle_check_pending)
     app.router.add_post('/api/trial', handle_trial)
     app.router.add_post('/api/apply-referral', handle_apply_referral)
@@ -1150,7 +977,7 @@ async def start_web_server():
     app.router.add_post('/api/leave-family', handle_leave_family)
     app.router.add_post('/api/check-device', handle_check_device)
     app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
-    app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring) # <--- НОВЫЙ РОУТ
+    app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
@@ -1159,9 +986,13 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
     await check_amypay_token()
-    await asyncio.gather(start_web_server(), dp.start_polling(bot))
+    try:
+        await asyncio.gather(start_web_server(), dp.start_polling(bot))
+    except Exception as e:
+        logging.critical(f"Фатальная ошибка: {e}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())
