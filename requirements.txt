@@ -2,4 +2,5 @@ aiogram
 aiohttp-socks
 aiohttp
 aiohttp_cors
+aiohttp-cors
 firebase-admin
