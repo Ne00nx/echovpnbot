@@ -236,13 +236,26 @@ async def process_payment(callback: CallbackQuery):
         return
 
     days = plan['duration_days']
-    amount = plan['price_rub']
+    amount = float(plan['price_rub'])
     is_family = 'Семейная' in plan['name']
+    
+    # --- ПРИМЕНЕНИЕ ГЛОБАЛЬНОЙ СКИДКИ ---
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=discount_enabled,discount_percent", headers=headers_sb) as resp:
+            config_data = await resp.json()
+            if isinstance(config_data, list) and len(config_data) > 0:
+                cfg = config_data[0]
+                if cfg.get('discount_enabled') and cfg.get('discount_percent', 0) > 0:
+                    disc = float(cfg['discount_percent'])
+                    amount = amount - (amount * disc / 100)
+    # -------------------------------------
+
     order_id = f"{target_id}|{days}|{int(datetime.now().timestamp())}|{callback.from_user.id}|{str(is_family).lower()}|sub"
     
     pay_url = ""
     if IS_TEST_MODE:
-        pay_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={amount}"
+        pay_url = f"{PUBLIC_URL}/api/fake-pay?order_id={quote(order_id)}&amount={int(amount)}"
     else:
         api_url = "https://amypay.ru/api/v2/orders"
         headers = {"Authorization": f"Bearer {AMYPAY_API_KEY}", "Content-Type": "application/json"}
@@ -258,7 +271,7 @@ async def process_payment(callback: CallbackQuery):
             [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
         ])
-        await callback.message.edit_text(f"✅ Заказ на <b>{days} дней</b> (Сумма: {amount} ₽) создан!\n\nНажмите кнопку ниже, чтобы оплатить.", reply_markup=keyboard)
+        await callback.message.edit_text(f"✅ Заказ на <b>{days} дней</b> (Сумма: {int(amount)} ₽) создан!\n\nНажмите кнопку ниже, чтобы оплатить.", reply_markup=keyboard)
     else:
         await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]))
 
@@ -577,6 +590,17 @@ async def handle_create_amypay_payment(request):
         days = plan['duration_days']
         amount = float(plan['price_rub'])
         is_family = 'Семейная' in plan['name']
+
+        # --- ПРИМЕНЕНИЕ ГЛОБАЛЬНОЙ СКИДКИ ---
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=discount_enabled,discount_percent", headers=headers_sb) as resp:
+                config_data = await resp.json()
+                if isinstance(config_data, list) and len(config_data) > 0:
+                    cfg = config_data[0]
+                    if cfg.get('discount_enabled') and cfg.get('discount_percent', 0) > 0:
+                        disc = float(cfg['discount_percent'])
+                        amount = amount - (amount * disc / 100)
+        # -------------------------------------
 
         if promo_code:
             async with ClientSession() as session:
@@ -1217,11 +1241,11 @@ async def handle_admin_get_config(request):
         
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=snow_enabled,greeting_text,updated_at", headers=headers_sb) as resp:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=snow_enabled,greeting_text,updated_at,discount_enabled,discount_percent", headers=headers_sb) as resp:
                 data = await resp.json()
                 if isinstance(data, list) and len(data) > 0:
                     return web.Response(text=json.dumps(data[0]), status=200, content_type='application/json')
-                return web.Response(text=json.dumps({"snow_enabled": False, "greeting_text": None}), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({"snow_enabled": False, "greeting_text": None, "discount_enabled": False, "discount_percent": 0}), status=200, content_type='application/json')
     except Exception as e:
         logging.error(f"Admin get config error: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
@@ -1239,6 +1263,10 @@ async def handle_admin_update_config(request):
         if 'greeting_text' in data:
             greeting = (data['greeting_text'] or '').strip()
             update_data['greeting_text'] = greeting if greeting else None
+        if 'discount_enabled' in data:
+            update_data['discount_enabled'] = bool(data['discount_enabled'])
+        if 'discount_percent' in data:
+            update_data['discount_percent'] = int(data['discount_percent'])
         
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
@@ -1334,8 +1362,8 @@ async def start_web_server():
     app.router.add_post('/api/admin/push', handle_admin_push)
     app.router.add_post('/api/admin/delete-user', handle_admin_delete_user)
     app.router.add_post('/api/admin/change-password', handle_admin_change_password)
-    app.router.add_get('/api/admin/config', handle_admin_get_config)         # <-- НОВЫЙ
-    app.router.add_patch('/api/admin/config', handle_admin_update_config)    # <-- НОВЫЙ
+    app.router.add_get('/api/admin/config', handle_admin_get_config)         
+    app.router.add_patch('/api/admin/config', handle_admin_update_config)    
     
     app.router.add_get('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_post('/api/admin/promocodes', handle_admin_promocodes)
