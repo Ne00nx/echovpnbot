@@ -1210,6 +1210,46 @@ async def handle_admin_change_password(request):
         logging.error(f"Admin change password error: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
+async def handle_admin_get_config(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+        
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=snow_enabled,greeting_text,updated_at", headers=headers_sb) as resp:
+                data = await resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    return web.Response(text=json.dumps(data[0]), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({"snow_enabled": False, "greeting_text": None}), status=200, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Admin get config error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_update_config(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+        
+        data = await request.json()
+        update_data = {"updated_at": datetime.now(timezone.utc).isoformat()}
+        
+        if 'snow_enabled' in data:
+            update_data['snow_enabled'] = bool(data['snow_enabled'])
+        if 'greeting_text' in data:
+            greeting = (data['greeting_text'] or '').strip()
+            update_data['greeting_text'] = greeting if greeting else None
+        
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.patch(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1", json=update_data, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
+                if resp.status in [200, 204]:
+                    return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({"error": "Ошибка обновления"}), status=500, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Admin update config error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
 async def handle_admin_promocodes(request):
     try:
         if not await check_is_admin(request):
@@ -1293,7 +1333,9 @@ async def start_web_server():
     app.router.add_post('/api/admin/kick-family', handle_admin_kick_family)
     app.router.add_post('/api/admin/push', handle_admin_push)
     app.router.add_post('/api/admin/delete-user', handle_admin_delete_user)
-    app.router.add_post('/api/admin/change-password', handle_admin_change_password) # НОВЫЙ РОУТ
+    app.router.add_post('/api/admin/change-password', handle_admin_change_password)
+    app.router.add_get('/api/admin/config', handle_admin_get_config)         # <-- НОВЫЙ
+    app.router.add_patch('/api/admin/config', handle_admin_update_config)    # <-- НОВЫЙ
     
     app.router.add_get('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_post('/api/admin/promocodes', handle_admin_promocodes)
