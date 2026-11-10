@@ -7,6 +7,8 @@ import uuid
 import hashlib
 import time
 import re
+import random
+import string
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, F, Router
@@ -582,12 +584,10 @@ async def handle_create_amypay_payment(request):
                     promo_data = await resp.json()
                     if isinstance(promo_data, list) and len(promo_data) > 0:
                         promo = promo_data[0]
-                        # --- ПРОВЕРКА СРОКА ДЕЙСТВИЯ ПРОМОКОДА ---
                         if promo.get('expires_at'):
                             exp_date = datetime.fromisoformat(promo['expires_at'].replace('Z', '+00:00'))
                             if exp_date < datetime.now(timezone.utc):
                                 return web.Response(text=json.dumps({"error": "Срок действия промокода истек"}), status=400, content_type='application/json')
-                        # ------------------------------------------
                         amount = amount - (amount * promo['discount_percent'] / 100)
 
         order_id = f"{real_user_id}|{days}|{int(datetime.now().timestamp())}|0|{str(is_family).lower()}|sub"
@@ -1060,24 +1060,20 @@ async def handle_admin_give_days(request):
                         
                     await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
                     
-                    # --- ИСПРАВЛЕНИЕ: Синхронизируем семью при списании ---
                     async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as m_resp:
                         members = await m_resp.json()
                         if isinstance(members, list):
                             for m in members:
                                 await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{m['id']}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
-                    # ---------------------------------------------------
             elif days == 0:
                 update_data = {"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}
                 await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
                 
-                # --- ИСПРАВЛЕНИЕ: Синхронизируем семью при обнулении ---
                 async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as m_resp:
                     members = await m_resp.json()
                     if isinstance(members, list):
                         for m in members:
                             await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{m['id']}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
-                # ----------------------------------------------------
 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
@@ -1171,7 +1167,6 @@ async def handle_admin_delete_user(request):
                     return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
                 user_id = user_data[0]['id']
 
-            # Удаляем через Admin API Supabase (снесет и auth.users, и profiles из-за CASCADE)
             async with session.delete(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", headers=headers_sb) as resp:
                 if resp.status in [200, 204]:
                     return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
@@ -1179,6 +1174,40 @@ async def handle_admin_delete_user(request):
 
     except Exception as e:
         logging.error(f"Admin delete user error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_change_password(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json()
+        email = data.get('email')
+        
+        if not email:
+            return web.Response(text=json.dumps({"error": "Email required"}), status=400, content_type='application/json')
+
+        # Генерируем случайный пароль (10 символов: буквы и цифры)
+        chars = string.ascii_letters + string.digits
+        new_password = ''.join(random.choice(chars) for _ in range(10))
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            # Получаем ID пользователя
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if not isinstance(user_data, list) or not user_data:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                user_id = user_data[0]['id']
+
+            # Меняем пароль через Admin API
+            async with session.put(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", json={"password": new_password}, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
+                if resp.status in [200, 201]:
+                    return web.Response(text=json.dumps({"success": True, "new_password": new_password}), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({"error": "Ошибка смены пароля в Supabase"}), status=500, content_type='application/json')
+
+    except Exception as e:
+        logging.error(f"Admin change password error: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
 
 async def handle_admin_promocodes(request):
@@ -1263,10 +1292,9 @@ async def start_web_server():
     app.router.add_post('/api/admin/reset-device', handle_admin_reset_device)
     app.router.add_post('/api/admin/kick-family', handle_admin_kick_family)
     app.router.add_post('/api/admin/push', handle_admin_push)
-    
-    # НОВЫЙ РОУТ ДЛЯ УДАЛЕНИЯ ЮЗЕРА
     app.router.add_post('/api/admin/delete-user', handle_admin_delete_user)
-
+    app.router.add_post('/api/admin/change-password', handle_admin_change_password) # НОВЫЙ РОУТ
+    
     app.router.add_get('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_post('/api/admin/promocodes', handle_admin_promocodes)
     app.router.add_patch('/api/admin/promocodes', handle_admin_promocodes)
