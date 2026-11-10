@@ -89,8 +89,6 @@ async def get_plan_from_db(plan_id):
                 data = await resp.json()
                 if data and isinstance(data, list) and len(data) > 0:
                     return data[0]
-                elif not isinstance(data, list):
-                    logging.error(f"Ошибка получения тарифа: {data}")
     except Exception as e:
         logging.error(f"Ошибка получения тарифа: {e}")
     return None
@@ -445,7 +443,7 @@ async def close_ticket_user(callback: CallbackQuery):
     except: pass
 
 
-# --- БИЗНЕС-ЛОГИКА И API ---
+# --- БИЗНЕС-ЛОГИКА И API (ДЛЯ ПРИЛОЖЕНИЯ) ---
 
 async def process_successful_payment(user_id, days, is_bonus=False, is_family_plan=False, family_owner_expires=None):
     logging.info(f"Активация подписки для {user_id} на {days} дней (is_bonus={is_bonus}, family={is_family_plan})")
@@ -455,8 +453,12 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
         async with ClientSession() as session:
             async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=email,subscription_expires_at,referred_by,referral_bonus_paid,family_code,fcm_token", headers=headers_sb) as resp:
                 profile_data = await resp.json()
-                if not isinstance(profile_data, list) or not profile_data:
-                    logging.error(f"Профиль {user_id} не найден или ошибка: {profile_data}")
+                
+                if not isinstance(profile_data, list):
+                    logging.error(f"Ошибка Supabase при получении профиля: {profile_data}")
+                    return
+                if not profile_data:
+                    logging.error(f"Профиль {user_id} не найден")
                     return
                 
                 p = profile_data[0]
@@ -494,15 +496,12 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                 sid = server['sid']
                 flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') != 'ES' else ""
                 
-                # Формируем ссылку для клиента
                 url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none{flow_str}#EchoVPN-{server['name']}"
 
-                # ИСПРАВЛЕНИЕ: Если включен тестовый режим, не стучимся к реальной панели X-UI
                 if IS_TEST_MODE:
                     logging.info(f"[TEST MODE] Пропускаем запрос к серверу {server['name']}. Генерируем фейковую ссылку.")
                     return server['id'], url.replace(' ', '').replace('\n', '')
 
-                # Далее - боевой режим
                 headers_xui = {"Content-Type": "application/json", "Authorization": f"Bearer {server['api_token']}", "X-API-Key": server['api_token']}
                 base_url = server['api_url'].replace('/create', '')
                 
@@ -980,11 +979,213 @@ async def handle_cron_expiring(request):
         return web.Response(text=str(e), status=500)
 
 
+# --- АДМИН-ПАНЕЛЬ API ---
+
+async def check_is_admin(request):
+    real_user_id, _ = await get_user_from_token(request)
+    if not real_user_id: return False
+    
+    headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    async with ClientSession() as session:
+        async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{real_user_id}&select=role", headers=headers_sb) as resp:
+            data = await resp.json()
+            if isinstance(data, list) and len(data) > 0 and data[0].get('role') == 'admin':
+                return True
+    return False
+
+async def handle_admin_get_users(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json() if request.method == 'POST' else {}
+        search_query = data.get('search', '')
+        
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            url = f"{SUPABASE_URL}/rest/v1/profiles?select=id,email,subscription_plan,subscription_expires_at,active_devices,max_devices_allowed,family_owner_id,referral_code,created_at,role&order=created_at.desc&limit=100"
+            if search_query:
+                url += f"&email=ilike.*{search_query}*"
+                
+            async with session.get(url, headers=headers_sb) as resp:
+                users = await resp.json()
+                
+        return web.Response(text=json.dumps(users), status=200, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Admin get users error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_give_days(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json()
+        email = data.get('email')
+        days = int(data.get('days', 0))
+        
+        if not email:
+            return web.Response(text=json.dumps({"error": "Email required"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id,subscription_expires_at", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if not isinstance(user_data, list) or not user_data:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                
+                user_id = user_data[0]['id']
+                current_expires_str = user_data[0].get('subscription_expires_at')
+
+            if days > 0:
+                await process_successful_payment(user_id, days)
+            elif days < 0:
+                now = datetime.now(timezone.utc)
+                if current_expires_str:
+                    current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
+                    new_expires = current_expires + timedelta(days=days)
+                    if new_expires <= now:
+                        update_data = {"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}
+                    else:
+                        update_data = {"subscription_expires_at": new_expires.isoformat()}
+                    await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
+            elif days == 0:
+                await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}, headers={**headers_sb, "Content-Type": "application/json"})
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        logging.error(f"Admin give days error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_reset_device(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json()
+        email = data.get('email')
+        if not email: return web.Response(text=json.dumps({"error": "Email required"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if not isinstance(user_data, list) or not user_data:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                user_id = user_data[0]['id']
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"active_devices": []}, headers={**headers_sb, "Content-Type": "application/json"})
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_kick_family(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json()
+        email = data.get('email')
+        if not email: return web.Response(text=json.dumps({"error": "Email required"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=id", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if not isinstance(user_data, list) or not user_data:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                user_id = user_data[0]['id']
+            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"family_owner_id": None, "subscription_plan": None, "vless_urls": None, "subscription_expires_at": None}, headers={**headers_sb, "Content-Type": "application/json"})
+
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_push(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+            
+        data = await request.json()
+        email = data.get('email')
+        title = data.get('title', 'EchoVPN')
+        body = data.get('body', '')
+        
+        if not email or not body: return web.Response(text=json.dumps({"error": "Email and body required"}), status=400, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        async with ClientSession() as session:
+            async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?email=eq.{email}&select=fcm_token", headers=headers_sb) as resp:
+                user_data = await resp.json()
+                if not isinstance(user_data, list) or not user_data:
+                    return web.Response(text=json.dumps({"error": "User not found"}), status=404, content_type='application/json')
+                fcm_token = user_data[0].get('fcm_token')
+                if not fcm_token: return web.Response(text=json.dumps({"error": "User has no FCM token"}), status=400, content_type='application/json')
+
+        await send_push_notification(fcm_token, title, body)
+        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+    except Exception as e:
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+async def handle_admin_promocodes(request):
+    try:
+        if not await check_is_admin(request):
+            return web.Response(text=json.dumps({"error": "Forbidden"}), status=403, content_type='application/json')
+
+        headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        
+        async with ClientSession() as session:
+            if request.method == 'GET':
+                async with session.get(f"{SUPABASE_URL}/rest/v1/promocodes?select=*&order=created_at.desc", headers=headers_sb) as resp:
+                    promos = await resp.json()
+                    return web.Response(text=json.dumps(promos), status=200, content_type='application/json')
+            
+            elif request.method == 'POST':
+                data = await request.json()
+                code = data.get('code', '').strip().upper()
+                discount = data.get('discount_percent')
+                is_active = data.get('is_active', True)
+                
+                if not code or not discount:
+                    return web.Response(text=json.dumps({"error": "Code and discount required"}), status=400, content_type='application/json')
+
+                payload = {"code": code, "discount_percent": discount, "is_active": is_active}
+                async with session.post(f"{SUPABASE_URL}/rest/v1/promocodes", json=payload, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
+                    if resp.status == 201:
+                        return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+                    return web.Response(text=json.dumps({"error": "Ошибка создания"}), status=400, content_type='application/json')
+
+            elif request.method == 'PATCH':
+                data = await request.json()
+                code = data.get('code')
+                if not code: return web.Response(text=json.dumps({"error": "Code required"}), status=400, content_type='application/json')
+                
+                update_data = {}
+                if 'discount_percent' in data: update_data['discount_percent'] = data['discount_percent']
+                if 'is_active' in data: update_data['is_active'] = data['is_active']
+                
+                async with session.patch(f"{SUPABASE_URL}/rest/v1/promocodes?code=eq.{code}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
+                    return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+
+            elif request.method == 'DELETE':
+                code = request.query.get('code')
+                if not code: return web.Response(text=json.dumps({"error": "Code required"}), status=400, content_type='application/json')
+                
+                async with session.delete(f"{SUPABASE_URL}/rest/v1/promocodes?code=eq.{code}", headers=headers_sb) as resp:
+                    return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
+
+    except Exception as e:
+        logging.error(f"Admin promocodes error: {e}")
+        return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
+
+
 # --- ЗАПУСК ---
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="EchoVPN bot is running!"))
+    
+    # Роуты для мобильного приложения
     app.router.add_post('/api/amypay/create-payment', handle_create_amypay_payment)
     app.router.add_post('/api/amypay/webhook', handle_amypay_webhook)
     app.router.add_get('/api/fake-pay', handle_fake_pay)
@@ -997,6 +1198,14 @@ async def start_web_server():
     app.router.add_post('/api/check-device', handle_check_device)
     app.router.add_post('/api/buy-device-slot', handle_buy_device_slot)
     app.router.add_post('/api/cron/notify-expiring', handle_cron_expiring)
+
+    # Роуты для админки
+    app.router.add_post('/api/admin/users', handle_admin_get_users)
+    app.router.add_post('/api/admin/give-days', handle_admin_give_days)
+    app.router.add_post('/api/admin/reset-device', handle_admin_reset_device)
+    app.router.add_post('/api/admin/kick-family', handle_admin_kick_family)
+    app.router.add_post('/api/admin/push', handle_admin_push)
+    app.router.add_route('*', '/api/admin/promocodes', handle_admin_promocodes)
 
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
