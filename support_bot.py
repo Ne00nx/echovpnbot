@@ -1272,11 +1272,18 @@ async def handle_admin_get_config(request):
         
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
-            async with session.get(f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=snow_enabled,greeting_text,updated_at,discount_enabled,discount_percent", headers=headers_sb) as resp:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/app_config?id=eq.1&select=snow_enabled,greeting_text,updated_at,discount_enabled,discount_percent,new_year_decorations_enabled",
+                headers=headers_sb
+            ) as resp:
                 data = await resp.json()
                 if isinstance(data, list) and len(data) > 0:
                     return web.Response(text=json.dumps(data[0]), status=200, content_type='application/json')
-                return web.Response(text=json.dumps({"snow_enabled": False, "greeting_text": None, "discount_enabled": False, "discount_percent": 0}), status=200, content_type='application/json')
+                return web.Response(text=json.dumps({
+                    "snow_enabled": False, "greeting_text": None, 
+                    "discount_enabled": False, "discount_percent": 0,
+                    "new_year_decorations_enabled": False
+                }), status=200, content_type='application/json')
     except Exception as e:
         logging.error(f"Admin get config error: {e}")
         return web.Response(text=json.dumps({"error": str(e)}), status=500, content_type='application/json')
@@ -1298,6 +1305,8 @@ async def handle_admin_update_config(request):
             update_data['discount_enabled'] = bool(data['discount_enabled'])
         if 'discount_percent' in data:
             update_data['discount_percent'] = int(data['discount_percent'])
+        if 'new_year_decorations_enabled' in data:
+            update_data['new_year_decorations_enabled'] = bool(data['new_year_decorations_enabled'])
         
         headers_sb = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
         async with ClientSession() as session:
@@ -1426,4 +1435,4 @@ async def main():
         raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) 
