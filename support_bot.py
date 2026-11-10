@@ -1052,13 +1052,32 @@ async def handle_admin_give_days(request):
                 if current_expires_str:
                     current_expires = datetime.fromisoformat(current_expires_str.replace('Z', '+00:00'))
                     new_expires = current_expires + timedelta(days=days)
+                    
                     if new_expires <= now:
                         update_data = {"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}
                     else:
                         update_data = {"subscription_expires_at": new_expires.isoformat()}
+                        
                     await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
+                    
+                    # --- ИСПРАВЛЕНИЕ: Синхронизируем семью при списании ---
+                    async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as m_resp:
+                        members = await m_resp.json()
+                        if isinstance(members, list):
+                            for m in members:
+                                await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{m['id']}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
+                    # ---------------------------------------------------
             elif days == 0:
-                await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json={"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}, headers={**headers_sb, "Content-Type": "application/json"})
+                update_data = {"subscription_plan": None, "subscription_expires_at": None, "vless_urls": None}
+                await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
+                
+                # --- ИСПРАВЛЕНИЕ: Синхронизируем семью при обнулении ---
+                async with session.get(f"{SUPABASE_URL}/rest/v1/profiles?family_owner_id=eq.{user_id}&select=id", headers=headers_sb) as m_resp:
+                    members = await m_resp.json()
+                    if isinstance(members, list):
+                        for m in members:
+                            await session.patch(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{m['id']}", json=update_data, headers={**headers_sb, "Content-Type": "application/json"})
+                # ----------------------------------------------------
 
         return web.Response(text=json.dumps({"success": True}), status=200, content_type='application/json')
     except Exception as e:
@@ -1186,10 +1205,8 @@ async def handle_admin_promocodes(request):
 
                 payload = {"code": code, "discount_percent": discount, "is_active": is_active}
                 
-                # --- ДОБАВЛЕНО: Передача даты истечения ---
                 if data.get('expires_at'):
                     payload['expires_at'] = data['expires_at']
-                # ------------------------------------------
                 
                 async with session.post(f"{SUPABASE_URL}/rest/v1/promocodes", json=payload, headers={**headers_sb, "Content-Type": "application/json"}) as resp:
                     if resp.status == 201:
