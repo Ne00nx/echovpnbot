@@ -27,7 +27,7 @@ from firebase_admin import credentials, messaging
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '621860210'))
-APK_URL = 'https://disk.yandex.ru/d/II9QBaio8oE8jQ' 
+APK_URL = 'https://disk.yandex.ru/d/cr2U_nNjYgiKYQ' 
 
 SUPABASE_URL = (os.getenv('SUPABASE_URL') or '').rstrip('/')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
