@@ -550,7 +550,7 @@ async def process_successful_payment(user_id, days, is_bonus=False, is_family_pl
                 domain = server['domain']
                 pbk = server['pbk']
                 sid = server['sid']
-                flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') != 'ES' else ""
+                flow_str = "&flow=xtls-rprx-vision" if server.get('country_code') not in ['ES', 'CH'] else ""
                 
                 url = f"vless://{client_uuid}@{domain}:443?type=tcp&security=reality&sni={domain}&fp=firefox&pbk={pbk}&sid={sid}&spx=%2F&encryption=none{flow_str}#EchoVPN-{server['name']}"
 
